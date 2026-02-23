@@ -346,6 +346,54 @@ class ChatService:
         end = start + state.page_size
         return state.prefetched_results[start:end]
 
+    def _format_published_date(self, p: Dict[str, Any]) -> str:
+        """
+        Returns YYYY-MM-DD if possible, else "".
+        Handles common keys and common shapes:
+          - "published": "2024-06-27T18:00:00Z"
+          - "published": {"date": "..."} (rare)
+          - "published_date": "..."
+          - "created": "..." (some clients)
+        """
+        val = (
+            p.get("published")
+            or p.get("published_date")
+            or p.get("created")
+            or p.get("date")
+            or ""
+        )
+
+        # Sometimes nested dicts happen
+        if isinstance(val, dict):
+            val = val.get("date") or val.get("value") or ""
+
+        if not isinstance(val, str):
+            val = str(val) if val is not None else ""
+
+        val = val.strip()
+        if not val:
+            return ""
+
+        # Convert ISO -> YYYY-MM-DD
+        if "T" in val:
+            return val.split("T", 1)[0].strip()
+
+        # Already date-like
+        return val[:10].strip()
+
+    def _format_authors(self, p: Dict[str, Any], max_authors: int = 6) -> str:
+        authors = p.get("authors") or p.get("author") or p.get("creators") or []
+        if isinstance(authors, list):
+            clean = [str(a).strip() for a in authors if str(a).strip()]
+            if not clean:
+                return ""
+            if len(clean) <= max_authors:
+                return ", ".join(clean)
+            return ", ".join(clean[:max_authors]) + ", et al."
+        if authors:
+            return str(authors).strip()
+        return ""
+
     def _format_list_reply(self, state, start: int, page: List[Dict[str, Any]], note: str = "") -> str:
         if not page:
             return "No results found."
@@ -358,39 +406,49 @@ class ChatService:
         shown_to = start + len(page)
         loaded = len(state.prefetched_results)
 
-        lines = []
+        lines: List[str] = []
         lines.append(f"Showing {shown_from}-{shown_to} of {total_str} for **{state.current_query}** {note}".strip())
         lines.append(f"(loaded in session cache: {loaded})")
+
+        # IMPORTANT: Do NOT show arXiv id here
         for i, p in enumerate(page, start=1):
             title = (p.get("title") or "").strip() or "Untitled"
-            arxiv_id = (p.get("arxiv_id") or p.get("id") or "").strip()
-            if arxiv_id:
-                lines.append(f"{i}) {title} — {arxiv_id}")
+            authors_str = self._format_authors(p, max_authors=6)
+            published = self._format_published_date(p)
+
+            meta_bits: List[str] = []
+            if authors_str:
+                meta_bits.append(f"Authors: {authors_str}")
+            if published:
+                meta_bits.append(f"Published: {published}")
+
+            if meta_bits:
+                lines.append(f"{i}) {title}\n   " + " | ".join(meta_bits))
             else:
                 lines.append(f"{i}) {title}")
+
         return "\n".join(lines)
 
     def _format_paper_reply(self, p: Dict[str, Any]) -> str:
         title = (p.get("title") or "").strip() or "Untitled"
-        arxiv_id = (p.get("arxiv_id") or p.get("id") or "").strip()
-        authors = p.get("authors") or p.get("author") or []
-        if isinstance(authors, list):
-            authors_str = ", ".join([str(a) for a in authors][:8])
-        else:
-            authors_str = str(authors)
+
+        # IMPORTANT: Do NOT show arXiv id in the detailed view either
+        authors_str = self._format_authors(p, max_authors=8)
+        published = self._format_published_date(p)
 
         summary = (p.get("summary") or p.get("abstract") or "").strip()
         if len(summary) > 900:
             summary = summary[:900].rstrip() + "..."
 
-        lines = [f"**{title}**"]
-        if arxiv_id:
-            lines.append(f"arXiv: {arxiv_id}")
+        lines: List[str] = [f"**{title}**"]
         if authors_str:
             lines.append(f"Authors: {authors_str}")
+        if published:
+            lines.append(f"Published: {published}")
         if summary:
             lines.append("")
             lines.append(summary)
+
         return "\n".join(lines)
 
     def _help_text(self) -> str:
