@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # Default search behavior
     default_max_results: int = 10
-    max_max_results: int = 50  # hard cap to protect your backend
+    max_max_results: int = 500  # hard cap to protect your backend
 
     # User agent (arXiv asks for reasonable identification)
     user_agent: str = "arxiv-backend-mvp/0.1 (contact: you@example.com)"

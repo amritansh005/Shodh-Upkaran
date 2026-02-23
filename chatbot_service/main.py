@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from fastapi import FastAPI
 import uvicorn
@@ -13,7 +12,11 @@ from chatbot_service.services.session_store import InMemorySessionStore
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file="chatbot_service/.env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file="chatbot_service/.env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     chatbot_host: str = "127.0.0.1"
     chatbot_port: int = 9000
@@ -24,6 +27,14 @@ class Settings(BaseSettings):
     azure_openai_api_key: str = ""
     azure_openai_deployment: str = "gpt-4o"
     azure_openai_api_version: str = "2025-01-01-preview"
+
+    # -----------------------------
+    # Pagination / progressive prefetch (chunking)
+    # -----------------------------
+    page_size_default: int = 10
+    prefetch_max_results: int = 200
+    prefetch_chunk_size: int = 200
+    hard_total_cap: int = 5000
 
 
 settings = Settings()
@@ -39,7 +50,17 @@ llm_client = LLMClient(
     deployment=settings.azure_openai_deployment,
 )
 session_store = InMemorySessionStore()
-chat_service = ChatService(arxiv=arxiv_client, llm=llm_client, store=session_store)
+
+# IMPORTANT: ChatService __init__ is updated to accept these knobs.
+chat_service = ChatService(
+    arxiv=arxiv_client,
+    llm=llm_client,
+    store=session_store,
+    page_size_default=settings.page_size_default,
+    prefetch_max_results=settings.prefetch_max_results,
+    prefetch_chunk_size=settings.prefetch_chunk_size,
+    hard_total_cap=settings.hard_total_cap,
+)
 
 
 @app.get("/health")
@@ -48,6 +69,10 @@ async def health():
         "status": "ok",
         "llm_enabled": llm_client.enabled(),
         "arxiv_backend_base_url": settings.arxiv_backend_base_url,
+        "page_size_default": settings.page_size_default,
+        "prefetch_max_results": settings.prefetch_max_results,
+        "prefetch_chunk_size": settings.prefetch_chunk_size,
+        "hard_total_cap": settings.hard_total_cap,
     }
 
 

@@ -1,353 +1,417 @@
-# chatbot_service/services/chat_service.py
 from __future__ import annotations
 
-import json
 from typing import Any, Dict, List, Optional, Tuple
-
-import httpx
-
-from chatbot_service.schemas import Paper
-from chatbot_service.services.arxiv_backend_client import ArxivBackendClient
-from chatbot_service.services.llm_client import LLMClient
-from chatbot_service.services.session_store import InMemorySessionStore, SessionState
 
 
 class ChatService:
     """
-    Chatbot brain:
-    - Uses LLM ONLY to route intent (search/next/open/paper/help/reset)
-    - Uses arxiv_backend via ArxivBackendClient for data
-    - Uses InMemorySessionStore for conversation state
+    Progressive prefetch (chunking) design:
 
-    IMPORTANT:
-    Your current InMemorySessionStore does NOT implement .set().
-    That is OK: store.get() returns the *same mutable SessionState object*
-    stored inside the dict, so mutating `state` is enough.
+    - On SEARCH: fetch prefetch_max_results once (e.g., 200) and cache in session.
+    - On NEXT / OPEN beyond loaded: fetch next chunks (prefetch_chunk_size) and append.
+    - For any page within already-loaded results: slice locally, no backend call.
+
+    This prevents repeated arXiv calls for pagination within already-fetched data.
     """
 
-    def __init__(self, arxiv: ArxivBackendClient, llm: LLMClient, store: InMemorySessionStore):
+    def __init__(
+        self,
+        arxiv,
+        llm,
+        store,
+        page_size_default: int = 10,
+        prefetch_max_results: int = 200,
+        prefetch_chunk_size: int = 200,
+        hard_total_cap: int = 5000,
+    ) -> None:
         self.arxiv = arxiv
         self.llm = llm
         self.store = store
 
-    async def handle_message(self, session_id: str, message: str) -> Tuple[str, Optional[List[Paper]], Dict[str, Any]]:
-        state = await self.store.get(session_id)
+        self.page_size_default = max(1, int(page_size_default))
+        self.prefetch_max_results = max(1, int(prefetch_max_results))
+        self.prefetch_chunk_size = max(1, int(prefetch_chunk_size))
+        self.hard_total_cap = max(100, int(hard_total_cap))
+
+    # -----------------------------
+    # Public entrypoint (LLM-only routing)
+    # -----------------------------
+    async def handle_message(
+        self, session_id: str, message: str
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        state = self.store.get(session_id)
         msg = (message or "").strip()
 
-        if not self.llm.enabled():
-            return (
-                "Azure OpenAI is not configured. Add AZURE_* settings in chatbot_service/.env and restart.",
-                None,
-                {"error": "llm_not_configured"},
-            )
+        if not msg:
+            return "Say something 🙂 (try: `search ai in healthcare`)", [], self._meta(state)
 
-        # LLM is the ONLY router.
-        intent = self._intent_from_llm(state, msg)
-        action = (intent.get("action") or "search").strip()
-
-        # -----------------------
-        # HELP
-        # -----------------------
-        if action == "help":
-            return (
-                "Commands:\n"
-                "- Search: type any topic (example: `ai in healthcare`)\n"
-                "- Next page: `next`\n"
-                "- Open from list: `open 3` / `open the 9th paper`\n"
-                "- Fetch by id: `paper 2401.01234`\n"
-                "- Reset: `reset`",
-                None,
-                {"action": "help"},
-            )
-
-        # -----------------------
-        # RESET
-        # -----------------------
-        if action == "reset":
-            await self.store.clear(session_id)
-            return "Session cleared. Tell me a topic to search on arXiv.", None, {"action": "reset"}
-
-        # -----------------------
-        # SEARCH
-        # -----------------------
-        if action == "search":
-            query = (intent.get("query") or msg).strip()
-            start = self._safe_int(intent.get("start"), default=0)
-            max_results = self._safe_int(intent.get("max_results"), default=state.page_size)
-
-            # Guardrails
-            if max_results <= 0:
-                max_results = state.page_size or 10
-            if max_results > 50:
-                max_results = 50  # keep responses sane
-
-            papers = await self._search(query=query, start=start, max_results=max_results)
-
-            # Save state for follow-ups like "next", "open 9"
-            state.last_query = query
-            state.last_start = start
-            state.page_size = max_results
-            state.last_results = papers
-
-            text = self._format_search_results(query, start, papers)
-            return text, papers, {"action": "search", "query": query, "start": start, "max_results": max_results}
-
-        # -----------------------
-        # NEXT PAGE
-        # -----------------------
-        if action == "next":
-            if not state.last_query:
-                return (
-                    "I don’t have an active search yet. Tell me a topic to search on arXiv.",
-                    None,
-                    {"action": "next", "error": "no_last_query"},
-                )
-
-            next_start = state.last_start + (state.page_size or 10)
-            papers = await self._search(query=state.last_query, start=next_start, max_results=state.page_size or 10)
-
-            state.last_start = next_start
-            state.last_results = papers
-
-            text = self._format_search_results(state.last_query, next_start, papers)
-            return text, papers, {"action": "next", "query": state.last_query, "start": next_start, "max_results": state.page_size}
-
-        # -----------------------
-        # OPEN Nth PAPER
-        # -----------------------
-        if action == "open":
-            index = self._safe_int(intent.get("index"), default=-1)
-            if index <= 0:
-                return "Tell me which paper number to open (example: `open 2`).", None, {"action": "open", "error": "invalid_index"}
-
-            if not state.last_results:
-                # LLM was instructed to return help instead, but keep this safe guard.
-                return "I don’t have a list yet. Search a topic first, then say `open 3`.", None, {"action": "open", "error": "no_last_results"}
-
-            if index > len(state.last_results):
-                return (
-                    f"I only have {len(state.last_results)} papers in the current list. "
-                    f"Try `open 1` to `open {len(state.last_results)}`.",
-                    None,
-                    {"action": "open", "error": "index_out_of_range", "count": len(state.last_results)},
-                )
-
-            paper = state.last_results[index - 1]
-            text = self._format_paper_detail(paper)
-            return text, [paper], {"action": "open", "index": index, "arxiv_id": paper.arxiv_id}
-
-        # -----------------------
-        # PAPER BY ID
-        # -----------------------
-        if action == "paper":
-            arxiv_id = (intent.get("arxiv_id") or "").strip()
-            if not arxiv_id:
-                return "Tell me the arXiv id (example: `paper 2401.01234`).", None, {"action": "paper", "error": "missing_arxiv_id"}
-
-            paper = await self._get_paper(arxiv_id)
-            if not paper:
-                return f"I couldn’t find that paper: {arxiv_id}", None, {"action": "paper", "error": "not_found", "arxiv_id": arxiv_id}
-
-            text = self._format_paper_detail(paper)
-            return text, [paper], {"action": "paper", "arxiv_id": arxiv_id}
-
-        # -----------------------
-        # Unknown action => treat as search (LLM-proof)
-        # -----------------------
-        papers = await self._search(query=msg, start=0, max_results=state.page_size or 10)
-        state.last_query = msg
-        state.last_start = 0
-        state.last_results = papers
-
-        text = self._format_search_results(msg, 0, papers)
-        return text, papers, {"action": "search_fallback", "query": msg, "start": 0, "max_results": state.page_size or 10}
-
-    async def _search(self, query: str, start: int, max_results: int) -> List[Paper]:
-        """
-        Call the arXiv backend client and return a List[Paper].
-
-        Your current ArxivBackendClient signature:
-            search(topic: str, start: int, max_results: int, ...)-> Dict[str,Any]
-
-        Older iterations might have used q= or query=.
-        We try safely in order.
-        """
-        try:
-            try:
-                resp = await self.arxiv.search(topic=query, start=start, max_results=max_results)
-            except TypeError:
-                # Backward-compat (if you swap client versions later)
-                try:
-                    resp = await self.arxiv.search(q=query, start=start, max_results=max_results)  # type: ignore[misc]
-                except TypeError:
-                    resp = await self.arxiv.search(query=query, start=start, max_results=max_results)  # type: ignore[misc]
-        except httpx.HTTPError:
-            return []
-
-        # Current client returns dict: {"papers":[Paper,...], "total_results":..., "error":...}
-        if isinstance(resp, dict):
-            if resp.get("error"):
-                return []
-            papers = resp.get("papers") or resp.get("results") or []
-            return papers if isinstance(papers, list) else []
-
-        # Some older client versions might return List[Paper]
-        return resp  # type: ignore[return-value]
-
-    async def _get_paper(self, arxiv_id: str) -> Optional[Paper]:
-        """
-        Current client method is get_paper(arxiv_id=...).
-        Keep a fallback for older client versions that used paper(...).
-        """
-        try:
-            if hasattr(self.arxiv, "get_paper"):
-                return await self.arxiv.get_paper(arxiv_id=arxiv_id)  # type: ignore[attr-defined]
-            return await self.arxiv.paper(arxiv_id=arxiv_id)  # type: ignore[attr-defined]
-        except httpx.HTTPError:
-            return None
-
-    # -----------------------
-    # LLM routing
-    # -----------------------
-    def _intent_from_llm(self, state: SessionState, msg: str) -> Dict[str, Any]:
-        """
-        Returns STRICT JSON only (no markdown, no extra keys):
-
-        - help:  {"action":"help"}
-        - reset: {"action":"reset"}
-        - search:{"action":"search","query":"...","start":0,"max_results":10}
-        - next:  {"action":"next"}
-        - open:  {"action":"open","index":3}
-        - paper: {"action":"paper","arxiv_id":"2401.01234"}
-        """
-
-        # Context for references like “open the 9th one”
-        last_results = state.last_results or []
-        preview_lines: List[str] = []
-        for i, p in enumerate(last_results[:25], start=1):
-            preview_lines.append(f"{i}) {p.title} — {p.arxiv_id}")
-        preview = "\n".join(preview_lines) if preview_lines else "(none)"
-
-        system = (
-            "You are an intent router for an arXiv chatbot.\n"
-            "Return ONLY a single JSON object. No markdown. No commentary.\n"
-            "Use EXACTLY one of these actions: help, reset, search, next, open, paper.\n\n"
-            "State (may be empty):\n"
-            f"- last_query: {state.last_query!r}\n"
-            f"- last_start: {state.last_start}\n"
-            f"- page_size: {state.page_size}\n"
-            f"- last_results_count: {len(last_results)}\n"
-            "- last_results_preview (1-indexed):\n"
-            f"{preview}\n\n"
-            "Output JSON schema (no extra keys):\n"
-            "- help  => {\"action\":\"help\"}\n"
-            "- reset => {\"action\":\"reset\"}\n"
-            "- next  => {\"action\":\"next\"}\n"
-            "- open  => {\"action\":\"open\",\"index\":<int>}\n"
-            "- paper => {\"action\":\"paper\",\"arxiv_id\":\"<id>\"}\n"
-            "- search=> {\"action\":\"search\",\"query\":\"<topic>\",\"start\":<int>,\"max_results\":<int>}\n\n"
-            "Routing rules:\n"
-            "1) If user asks for help/commands/examples => action=help.\n"
-            "2) If user asks to reset/clear/start over => action=reset.\n"
-            "3) If user asks for next page / more results / continue => action=next.\n"
-            "4) If user asks to open/show/display a specific item from the last results by number or ordinal\n"
-            "   (e.g., 'open 9', 'open the ninth paper', 'show me the 3rd one') => action=open with that index.\n"
-            "5) If user provides an explicit arXiv id (e.g., 2401.01234 or 2103.14954) or says 'paper <id>' => action=paper.\n"
-            "6) Otherwise treat the message as a search request => action=search with query=the message.\n\n"
-            "Defaults for search: start=0, max_results=10 unless user explicitly requests another page size.\n"
-            "If last_results_count is 0 and user asks to open, return action=help instead of guessing.\n"
+        # LLM-only routing + slot extraction (NO REGEX)
+        intent = self.llm.parse_intent(
+            user_message=msg,
+            session_state=self._meta(state),
         )
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": msg},
-        ]
+        action = (intent.get("action") or "chat").strip().lower()
+        topic = (intent.get("topic") or "").strip()
+        index = intent.get("index", None)
+        arxiv_id = (intent.get("arxiv_id") or "").strip()
+        chat_response = (intent.get("chat_response") or "").strip()
 
-        raw = self.llm.chat(messages, temperature=0.0).strip()
+        if action == "help":
+            return self._help_text(), [], self._meta(state)
 
-        data = self._safe_json_object(raw)
-        if isinstance(data, dict) and "action" in data:
-            if data["action"] == "search":
-                data.setdefault("start", 0)
-                data.setdefault("max_results", 10)
-                data.setdefault("query", msg)
-            return data
+        if action == "reset":
+            self.store.reset(session_id)
+            state = self.store.get(session_id)
+            return "Reset done. You can `search <topic>` again.", [], self._meta(state)
 
-        # Safe fallback if parsing fails
-        return {"action": "search", "query": msg, "start": 0, "max_results": 10}
+        if action == "search":
+            if not topic:
+                return "Please provide a topic. Example: `search ai in healthcare`", [], self._meta(state)
+            return await self._do_search(state, topic)
 
-    def _safe_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        # The remaining actions require an active search context
+        if action in ("next", "open", "paper") and not state.current_query:
+            return (
+                "No active search yet. Use: `search <topic>` (example: `search transformers in nlp`).",
+                [],
+                self._meta(state),
+            )
+
+        if action == "next":
+            return await self._do_next(state)
+
+        if action == "open":
+            if index is None:
+                return "Usage: `open 5` (opens the 5th paper on the current page).", [], self._meta(state)
+            try:
+                idx_int = int(index)
+            except Exception:
+                return "Usage: `open 5` (opens the 5th paper on the current page).", [], self._meta(state)
+            return await self._do_open_index(state, idx_int)
+
+        if action == "paper":
+            if not arxiv_id:
+                return "Usage: `paper <arxiv_id>` (example: `paper 2003.10303`)", [], self._meta(state)
+            return await self._do_paper(state, arxiv_id)
+
+        # chat / small-talk
+        if action == "chat":
+            if chat_response:
+                return chat_response, [], self._meta(state)
+            return "Tell me a topic to search (example: `ai in healthcare`) or type `help`.", [], self._meta(state)
+
+        # Safety fallback
+        return "Unknown request. Type `help` to see allowed actions.", [], self._meta(state)
+
+    # -----------------------------
+    # Core behaviors
+    # -----------------------------
+    async def _do_search(
+        self, state, query: str
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        state.current_query = query.strip()
+        state.cursor_start = 0
+        state.page_size = self.page_size_default
+        state.total_results = None
+        state.prefetched_results = []
+        state.last_results = []
+
+        # Initial prefetch
+        fetched, total = await self._fetch_from_backend(
+            topic=state.current_query,
+            start=0,
+            max_results=min(self.prefetch_max_results, self.hard_total_cap),
+        )
+        state.prefetched_results = fetched
+        state.total_results = total
+
+        page = self._slice_page(state, start=0)
+        state.last_results = page
+
+        reply = self._format_list_reply(
+            state=state,
+            start=0,
+            page=page,
+            note="(cached — use `next` or `open <n>`)",
+        )
+        return reply, page, self._meta(state)
+
+    async def _do_next(self, state) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        next_start = state.cursor_start + state.page_size
+
+        # If total known and we're already at/over end
+        if state.total_results is not None and next_start >= state.total_results:
+            return "No more results.", [], self._meta(state)
+
+        # Ensure enough results are loaded locally for the next page
+        needed = next_start + state.page_size
+        print(
+            f"[CHATBOT] next requested -> cursor={state.cursor_start} "
+            f"page_size={state.page_size} needed={needed} loaded={len(state.prefetched_results)}"
+        )
+        await self._ensure_loaded(state, needed=needed)
+
+        # If still not enough (e.g., backend returned fewer than requested)
+        if next_start >= len(state.prefetched_results):
+            return "No more results.", [], self._meta(state)
+
+        state.cursor_start = next_start
+        page = self._slice_page(state, start=state.cursor_start)
+        state.last_results = page
+
+        reply = self._format_list_reply(
+            state=state,
+            start=state.cursor_start,
+            page=page,
+            note="(cached)" if len(page) else "",
+        )
+        return reply, page, self._meta(state)
+
+    async def _do_open_index(
+        self, state, idx: int
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         """
-        Best-effort JSON object parser without regex.
-        Extracts the first top-level JSON object by brace scanning.
+        LLM provides idx directly (no regex). Behavior:
+        - If idx fits within current page (state.last_results): open that.
+        - Else treat idx as global index across entire search and load as needed.
         """
-        if not text:
-            return None
+        if idx is None or idx <= 0:
+            return "Index must be >= 1. Example: `open 2`", [], self._meta(state)
 
-        text = text.strip()
+        # First interpret as "open Nth on current page"
+        if state.last_results and 1 <= idx <= len(state.last_results):
+            print(f"[CHATBOT] open served from CURRENT PAGE cache (idx={idx}, cursor_start={state.cursor_start})")
+            paper = state.last_results[idx - 1]
+            return self._format_paper_reply(paper), [paper], self._meta(state)
 
-        # Fast path: whole string is JSON
+        # Otherwise interpret as "open Nth overall in this search"
+        global_index = idx - 1
+        print(f"[CHATBOT] open needs GLOBAL cache (idx={idx}) -> ensure_loaded({global_index + 1})")
+        await self._ensure_loaded(state, needed=global_index + 1)
+
+        if global_index >= len(state.prefetched_results):
+            return "That index is beyond the results I have.", [], self._meta(state)
+
+        paper = state.prefetched_results[global_index]
+        return self._format_paper_reply(paper), [paper], self._meta(state)
+
+    async def _do_paper(
+        self, state, arg: str
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        arxiv_id = (arg or "").strip()
+        if not arxiv_id:
+            return "Usage: `paper <arxiv_id>` (example: `paper 2003.10303`)", [], self._meta(state)
+
+        # Delegate to backend if you have a "paper" endpoint; otherwise reuse open-from-cache if present.
+        # We'll attempt backend first (more reliable).
         try:
-            obj = json.loads(text)
-            return obj if isinstance(obj, dict) else None
+            paper = await self.arxiv.get_paper(arxiv_id)
+            if not paper:
+                return f"No paper found for arXiv id: {arxiv_id}", [], self._meta(state)
+
+            paper_dict = self._paper_to_dict(paper)
+            return self._format_paper_reply(paper_dict), [paper_dict], self._meta(state)
+
         except Exception:
-            pass
+            # Fallback: search within cached results
+            for p in state.prefetched_results:
+                pid = str(p.get("arxiv_id") or p.get("id") or "")
+                if pid == arxiv_id:
+                    return self._format_paper_reply(p), [p], self._meta(state)
+            return f"No paper found for arXiv id: {arxiv_id}", [], self._meta(state)
 
-        start = text.find("{")
-        if start == -1:
-            return None
+    # -----------------------------
+    # Progressive prefetch (chunking)
+    # -----------------------------
+    async def _ensure_loaded(self, state, needed: int) -> None:
+        """
+        Ensure at least `needed` items exist in state.prefetched_results.
+        Fetch additional chunks from backend only if required.
+        """
+        if needed <= len(state.prefetched_results):
+            return
 
-        depth = 0
-        in_str = False
-        escape = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_str:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_str = False
-                continue
+        # Don’t load beyond safety cap
+        if len(state.prefetched_results) >= self.hard_total_cap:
+            return
 
-            if ch == '"':
-                in_str = True
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    try:
-                        obj = json.loads(candidate)
-                        return obj if isinstance(obj, dict) else None
-                    except Exception:
-                        return None
+        # If total is known, don’t load beyond it
+        if state.total_results is not None and len(state.prefetched_results) >= state.total_results:
+            return
 
-        return None
+        # Fetch chunks until we satisfy `needed` or cannot fetch more
+        while len(state.prefetched_results) < needed:
+            start = len(state.prefetched_results)
 
-    # -----------------------
-    # Formatting helpers
-    # -----------------------
-    def _format_search_results(self, query: str, start: int, papers: List[Paper]) -> str:
-        if not papers:
-            return f"No results found for **{query}**."
+            # Determine how much to request this round
+            remaining_cap = self.hard_total_cap - start
+            chunk = min(self.prefetch_chunk_size, remaining_cap)
 
-        lines = [f"Showing {len(papers)} results for **{query}** (start={start}):"]
-        for i, p in enumerate(papers, start=1):
-            lines.append(f"{i}) {p.title} — {p.arxiv_id}")
+            # If total known, also cap to remaining total
+            if state.total_results is not None:
+                remaining_total = max(0, state.total_results - start)
+                chunk = min(chunk, remaining_total)
+
+            if chunk <= 0:
+                return
+
+            fetched, total = await self._fetch_from_backend(
+                topic=state.current_query,
+                start=start,
+                max_results=chunk,
+            )
+
+            # Update total if backend provides it
+            if state.total_results is None and total is not None:
+                state.total_results = total
+
+            # If backend returns nothing, stop
+            if not fetched:
+                return
+
+            state.prefetched_results.extend(fetched)
+
+            # If backend returned fewer than requested, likely end reached
+            if len(fetched) < chunk:
+                return
+
+    def _paper_to_dict(self, p: Any) -> Dict[str, Any]:
+        """
+        Normalize backend/client objects to dict so `.get()` works everywhere.
+        Supports:
+          - dict
+          - Pydantic v2 models (model_dump)
+          - Pydantic v1 models (dict)
+        """
+        if isinstance(p, dict):
+            return p
+
+        if hasattr(p, "model_dump"):
+            try:
+                return p.model_dump()
+            except Exception:
+                pass
+
+        if hasattr(p, "dict"):
+            try:
+                return p.dict()
+            except Exception:
+                pass
+
+        try:
+            return dict(p)
+        except Exception:
+            return {"title": str(p)}
+
+    async def _fetch_from_backend(
+        self, topic: str, start: int, max_results: int
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """
+        We keep it defensive so your existing backend response shape still works.
+        Also normalizes results into dicts (Paper -> dict).
+        """
+        print(f"[CHATBOT] backend.search(topic={topic!r}, start={start}, max_results={max_results})")
+        resp = await self.arxiv.search(topic=topic, start=start, max_results=max_results)
+
+        if resp is None:
+            return [], None
+
+        # dict response: {"results": [...], "total_results": 1234, ...}
+        if isinstance(resp, dict):
+            raw_results = resp.get("results") or resp.get("items") or resp.get("papers") or []
+            total = resp.get("total_results") or resp.get("total") or resp.get("count")
+            try:
+                total = int(total) if total is not None else None
+            except Exception:
+                total = None
+
+            if not isinstance(raw_results, list):
+                return [], total
+
+            results = [self._paper_to_dict(p) for p in raw_results]
+            return results, total
+
+        # list response: [Paper|dict...]
+        if isinstance(resp, list):
+            results = [self._paper_to_dict(p) for p in resp]
+            return results, None
+
+        return [], None
+
+    # -----------------------------
+    # Utilities: formatting
+    # -----------------------------
+    def _slice_page(self, state, start: int) -> List[Dict[str, Any]]:
+        end = start + state.page_size
+        return state.prefetched_results[start:end]
+
+    def _format_list_reply(self, state, start: int, page: List[Dict[str, Any]], note: str = "") -> str:
+        if not page:
+            return "No results found."
+
+        total_str = "?"
+        if state.total_results is not None:
+            total_str = str(state.total_results)
+
+        shown_from = start + 1
+        shown_to = start + len(page)
+        loaded = len(state.prefetched_results)
+
+        lines = []
+        lines.append(f"Showing {shown_from}-{shown_to} of {total_str} for **{state.current_query}** {note}".strip())
+        lines.append(f"(loaded in session cache: {loaded})")
+        for i, p in enumerate(page, start=1):
+            title = (p.get("title") or "").strip() or "Untitled"
+            arxiv_id = (p.get("arxiv_id") or p.get("id") or "").strip()
+            if arxiv_id:
+                lines.append(f"{i}) {title} — {arxiv_id}")
+            else:
+                lines.append(f"{i}) {title}")
         return "\n".join(lines)
 
-    def _format_paper_detail(self, p: Paper) -> str:
-        authors = ", ".join(p.authors or [])
-        abstract = (p.abstract or "").strip()
-        return f"**{p.title}**\narXiv: {p.arxiv_id}\nAuthors: {authors}\n\n{abstract}"
+    def _format_paper_reply(self, p: Dict[str, Any]) -> str:
+        title = (p.get("title") or "").strip() or "Untitled"
+        arxiv_id = (p.get("arxiv_id") or p.get("id") or "").strip()
+        authors = p.get("authors") or p.get("author") or []
+        if isinstance(authors, list):
+            authors_str = ", ".join([str(a) for a in authors][:8])
+        else:
+            authors_str = str(authors)
 
-    @staticmethod
-    def _safe_int(value: Any, default: int) -> int:
-        try:
-            return int(value)
-        except Exception:
-            return default
+        summary = (p.get("summary") or p.get("abstract") or "").strip()
+        if len(summary) > 900:
+            summary = summary[:900].rstrip() + "..."
+
+        lines = [f"**{title}**"]
+        if arxiv_id:
+            lines.append(f"arXiv: {arxiv_id}")
+        if authors_str:
+            lines.append(f"Authors: {authors_str}")
+        if summary:
+            lines.append("")
+            lines.append(summary)
+        return "\n".join(lines)
+
+    def _help_text(self) -> str:
+        return (
+            "Actions allowed:\n"
+            "- `help`\n"
+            "- `reset`\n"
+            "- `search <topic>`\n"
+            "- `next`\n"
+            "- `open <n>` (opens the nth paper on current page; if not on page, tries nth overall)\n"
+            "- `paper <arxiv_id>`\n"
+        )
+
+    def _meta(self, state) -> Dict[str, Any]:
+        return {
+            "query": state.current_query,
+            "cursor_start": state.cursor_start,
+            "page_size": state.page_size,
+            "loaded": len(state.prefetched_results),
+            "total_results": state.total_results,
+            "prefetch_max_results": self.prefetch_max_results,
+            "prefetch_chunk_size": self.prefetch_chunk_size,
+            "hard_total_cap": self.hard_total_cap,
+        }

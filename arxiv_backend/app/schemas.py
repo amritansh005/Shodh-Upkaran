@@ -8,7 +8,7 @@ SortOrder = Literal["ascending", "descending"]
 
 class SearchRequest(BaseModel):
     topic: str = Field(..., min_length=2, description="Search topic, e.g., 'ai for healthcare'")
-    max_results: int = Field(10, ge=1, le=50, description="Number of results to return (1-50)")
+    max_results: int = Field(10, ge=1, le=500, description="Number of results to return (1-500)")
     start: int = Field(0, ge=0, description="Pagination offset")
     sort_by: SortBy = Field("relevance", description="arXiv sort option")
     sort_order: SortOrder = Field("descending", description="Sort order")
