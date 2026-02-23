@@ -13,189 +13,128 @@ from chatbot_service.services.session_store import InMemorySessionStore, Session
 
 
 class ChatService:
-    def __init__(
-        self,
-        arxiv: ArxivBackendClient,
-        llm: LLMClient,
-        store: InMemorySessionStore,
-    ) -> None:
+    """
+    Chatbot brain:
+    - Uses LLM ONLY to route intent (search/next/open/paper/help/reset)
+    - Uses arxiv_backend via ArxivBackendClient for data
+    - Uses InMemorySessionStore for conversation state
+
+    IMPORTANT:
+    Your current InMemorySessionStore does NOT implement .set().
+    That is OK: store.get() returns the *same mutable SessionState object*
+    stored inside the dict, so mutating `state` is enough.
+    """
+
+    def __init__(self, arxiv: ArxivBackendClient, llm: LLMClient, store: InMemorySessionStore):
         self.arxiv = arxiv
         self.llm = llm
         self.store = store
 
-    async def handle(
-        self, session_id: str, message: str
-    ) -> Tuple[str, Optional[List[Paper]], Dict[str, Any]]:
+    async def handle_message(self, session_id: str, message: str) -> Tuple[str, Optional[List[Paper]], Dict[str, Any]]:
         state = await self.store.get(session_id)
         msg = (message or "").strip()
-
-        if msg.lower() in {"help", "commands"}:
-            return (
-                "Commands:\n"
-                "- Search anything: `ai in healthcare`\n"
-                "- Or: `search: ai in healthcare`\n"
-                "- `next`\n"
-                "- `open 3`\n"
-                "- `paper 2401.01234`\n"
-                "- `reset`",
-                None,
-                {},
-            )
-
-        if msg.lower() in {"reset", "clear"}:
-            await self.store.clear(session_id)
-            return "Session cleared. Tell me a topic to search on arXiv.", None, {}
 
         if not self.llm.enabled():
             return (
                 "Azure OpenAI is not configured. Add AZURE_* settings in chatbot_service/.env and restart.",
                 None,
-                {"need_llm": True},
+                {"error": "llm_not_configured"},
             )
 
+        # LLM is the ONLY router.
         intent = self._intent_from_llm(state, msg)
-        action = intent.get("action", "search")
+        action = (intent.get("action") or "search").strip()
+
+        # -----------------------
+        # HELP
+        # -----------------------
+        if action == "help":
+            return (
+                "Commands:\n"
+                "- Search: type any topic (example: `ai in healthcare`)\n"
+                "- Next page: `next`\n"
+                "- Open from list: `open 3` / `open the 9th paper`\n"
+                "- Fetch by id: `paper 2401.01234`\n"
+                "- Reset: `reset`",
+                None,
+                {"action": "help"},
+            )
+
+        # -----------------------
+        # RESET
+        # -----------------------
+        if action == "reset":
+            await self.store.clear(session_id)
+            return "Session cleared. Tell me a topic to search on arXiv.", None, {"action": "reset"}
 
         # -----------------------
         # SEARCH
         # -----------------------
         if action == "search":
-            query = (intent.get("query") or "").strip()
-            start = int(intent.get("start", 0))
-            max_results = int(intent.get("max_results", state.page_size))
+            query = (intent.get("query") or msg).strip()
+            start = self._safe_int(intent.get("start"), default=0)
+            max_results = self._safe_int(intent.get("max_results"), default=state.page_size)
 
-            if not query:
-                return "Tell me what topic to search (example: AI in healthcare).", None, {}
+            # Guardrails
+            if max_results <= 0:
+                max_results = state.page_size or 10
+            if max_results > 50:
+                max_results = 50  # keep responses sane
 
-            try:
-                data = await self.arxiv.search(topic=query, start=start, max_results=max_results)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code if e.response is not None else None
-                if status in (502, 503, 504):
-                    return (
-                        "arXiv is slow/unreachable right now. Please try again in a moment.",
-                        None,
-                        {"action": "search", "error": "arxiv_backend_upstream", "status": status},
-                    )
-                return (
-                    f"Search failed (backend status {status}). Please try again.",
-                    None,
-                    {"action": "search", "error": "arxiv_backend_http_error", "status": status},
-                )
-            except httpx.RequestError:
-                return (
-                    "Could not reach the arXiv backend. Is arxiv_backend running on http://127.0.0.1:8000 ?",
-                    None,
-                    {"action": "search", "error": "arxiv_backend_unreachable"},
-                )
-            except Exception:
-                return (
-                    "Something went wrong while searching. Try again.",
-                    None,
-                    {"action": "search", "error": "unknown"},
-                )
+            papers = await self._search(query=query, start=start, max_results=max_results)
 
-            papers = data["papers"]
-
+            # Save state for follow-ups like "next", "open 9"
             state.last_query = query
             state.last_start = start
             state.page_size = max_results
             state.last_results = papers
 
-            reply = self._format_search_reply(query, start, papers)
-            return reply, papers, {"action": "search", "start": start}
+            text = self._format_search_results(query, start, papers)
+            return text, papers, {"action": "search", "query": query, "start": start, "max_results": max_results}
 
         # -----------------------
         # NEXT PAGE
         # -----------------------
         if action == "next":
             if not state.last_query:
-                return "No active search yet. Ask me a topic first (example: AI in healthcare).", None, {}
-
-            start = state.last_start + state.page_size
-
-            try:
-                data = await self.arxiv.search(topic=state.last_query, start=start, max_results=state.page_size)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code if e.response is not None else None
-                if status in (502, 503, 504):
-                    return (
-                        "arXiv is slow/unreachable right now. Please try `next` again in a moment.",
-                        None,
-                        {"action": "next", "error": "arxiv_backend_upstream", "status": status},
-                    )
                 return (
-                    f"Next page failed (backend status {status}). Please try again.",
+                    "I don’t have an active search yet. Tell me a topic to search on arXiv.",
                     None,
-                    {"action": "next", "error": "arxiv_backend_http_error", "status": status},
-                )
-            except httpx.RequestError:
-                return (
-                    "Could not reach the arXiv backend. Is arxiv_backend running on http://127.0.0.1:8000 ?",
-                    None,
-                    {"action": "next", "error": "arxiv_backend_unreachable"},
-                )
-            except Exception:
-                return (
-                    "Something went wrong while getting the next page. Try again.",
-                    None,
-                    {"action": "next", "error": "unknown"},
+                    {"action": "next", "error": "no_last_query"},
                 )
 
-            papers = data["papers"]
+            next_start = state.last_start + (state.page_size or 10)
+            papers = await self._search(query=state.last_query, start=next_start, max_results=state.page_size or 10)
 
-            state.last_start = start
+            state.last_start = next_start
             state.last_results = papers
 
-            reply = self._format_search_reply(state.last_query, start, papers)
-            return reply, papers, {"action": "next", "start": start}
+            text = self._format_search_results(state.last_query, next_start, papers)
+            return text, papers, {"action": "next", "query": state.last_query, "start": next_start, "max_results": state.page_size}
 
         # -----------------------
-        # OPEN Nth PAPER (from last search results)
+        # OPEN Nth PAPER
         # -----------------------
         if action == "open":
-            index = int(intent.get("index", 1))
+            index = self._safe_int(intent.get("index"), default=-1)
+            if index <= 0:
+                return "Tell me which paper number to open (example: `open 2`).", None, {"action": "open", "error": "invalid_index"}
+
             if not state.last_results:
-                return "No results stored yet. Search a topic first.", None, {}
+                # LLM was instructed to return help instead, but keep this safe guard.
+                return "I don’t have a list yet. Search a topic first, then say `open 3`.", None, {"action": "open", "error": "no_last_results"}
 
-            if index < 1 or index > len(state.last_results):
-                return f"Pick a number between 1 and {len(state.last_results)}.", None, {}
-
-            chosen = state.last_results[index - 1]
-
-            try:
-                full = await self.arxiv.get_paper(chosen.arxiv_id)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code if e.response is not None else None
-                if status in (502, 503, 504):
-                    return (
-                        "arXiv is slow/unreachable right now. Please try opening that paper again.",
-                        None,
-                        {"action": "open", "error": "arxiv_backend_upstream", "status": status, "index": index},
-                    )
+            if index > len(state.last_results):
                 return (
-                    f"Couldn’t fetch that paper (backend status {status}). Try again.",
+                    f"I only have {len(state.last_results)} papers in the current list. "
+                    f"Try `open 1` to `open {len(state.last_results)}`.",
                     None,
-                    {"action": "open", "error": "arxiv_backend_http_error", "status": status, "index": index},
-                )
-            except httpx.RequestError:
-                return (
-                    "Could not reach the arXiv backend. Is arxiv_backend running on http://127.0.0.1:8000 ?",
-                    None,
-                    {"action": "open", "error": "arxiv_backend_unreachable", "index": index},
-                )
-            except Exception:
-                return (
-                    "Couldn’t fetch that paper right now. Try again.",
-                    None,
-                    {"action": "open", "error": "unknown", "index": index},
+                    {"action": "open", "error": "index_out_of_range", "count": len(state.last_results)},
                 )
 
-            if not full:
-                return "Couldn’t fetch that paper right now.", None, {"action": "open", "index": index}
-
-            reply = self._format_paper(full)
-            return reply, [full], {"action": "open", "index": index}
+            paper = state.last_results[index - 1]
+            text = self._format_paper_detail(paper)
+            return text, [paper], {"action": "open", "index": index, "arxiv_id": paper.arxiv_id}
 
         # -----------------------
         # PAPER BY ID
@@ -203,71 +142,120 @@ class ChatService:
         if action == "paper":
             arxiv_id = (intent.get("arxiv_id") or "").strip()
             if not arxiv_id:
-                return "Send: paper <arxiv_id> (example: paper 2401.01234)", None, {}
+                return "Tell me the arXiv id (example: `paper 2401.01234`).", None, {"action": "paper", "error": "missing_arxiv_id"}
 
+            paper = await self._get_paper(arxiv_id)
+            if not paper:
+                return f"I couldn’t find that paper: {arxiv_id}", None, {"action": "paper", "error": "not_found", "arxiv_id": arxiv_id}
+
+            text = self._format_paper_detail(paper)
+            return text, [paper], {"action": "paper", "arxiv_id": arxiv_id}
+
+        # -----------------------
+        # Unknown action => treat as search (LLM-proof)
+        # -----------------------
+        papers = await self._search(query=msg, start=0, max_results=state.page_size or 10)
+        state.last_query = msg
+        state.last_start = 0
+        state.last_results = papers
+
+        text = self._format_search_results(msg, 0, papers)
+        return text, papers, {"action": "search_fallback", "query": msg, "start": 0, "max_results": state.page_size or 10}
+
+    async def _search(self, query: str, start: int, max_results: int) -> List[Paper]:
+        """
+        Call the arXiv backend client and return a List[Paper].
+
+        Your current ArxivBackendClient signature:
+            search(topic: str, start: int, max_results: int, ...)-> Dict[str,Any]
+
+        Older iterations might have used q= or query=.
+        We try safely in order.
+        """
+        try:
             try:
-                full = await self.arxiv.get_paper(arxiv_id)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code if e.response is not None else None
-                if status == 404:
-                    return "Paper not found.", None, {"action": "paper", "arxiv_id": arxiv_id, "status": status}
-                if status in (502, 503, 504):
-                    return (
-                        "arXiv is slow/unreachable right now. Please try again in a moment.",
-                        None,
-                        {"action": "paper", "error": "arxiv_backend_upstream", "status": status, "arxiv_id": arxiv_id},
-                    )
-                return (
-                    f"Couldn’t fetch that paper (backend status {status}). Try again.",
-                    None,
-                    {"action": "paper", "error": "arxiv_backend_http_error", "status": status, "arxiv_id": arxiv_id},
-                )
-            except httpx.RequestError:
-                return (
-                    "Could not reach the arXiv backend. Is arxiv_backend running on http://127.0.0.1:8000 ?",
-                    None,
-                    {"action": "paper", "error": "arxiv_backend_unreachable", "arxiv_id": arxiv_id},
-                )
-            except Exception:
-                return (
-                    "Couldn’t fetch that paper right now. Try again.",
-                    None,
-                    {"action": "paper", "error": "unknown", "arxiv_id": arxiv_id},
-                )
+                resp = await self.arxiv.search(topic=query, start=start, max_results=max_results)
+            except TypeError:
+                # Backward-compat (if you swap client versions later)
+                try:
+                    resp = await self.arxiv.search(q=query, start=start, max_results=max_results)  # type: ignore[misc]
+                except TypeError:
+                    resp = await self.arxiv.search(query=query, start=start, max_results=max_results)  # type: ignore[misc]
+        except httpx.HTTPError:
+            return []
 
-            if not full:
-                return "Paper not found.", None, {"action": "paper", "arxiv_id": arxiv_id}
+        # Current client returns dict: {"papers":[Paper,...], "total_results":..., "error":...}
+        if isinstance(resp, dict):
+            if resp.get("error"):
+                return []
+            papers = resp.get("papers") or resp.get("results") or []
+            return papers if isinstance(papers, list) else []
 
-            reply = self._format_paper(full)
-            return reply, [full], {"action": "paper", "arxiv_id": arxiv_id}
+        # Some older client versions might return List[Paper]
+        return resp  # type: ignore[return-value]
 
-        return "Tell me a topic to search, or type `help`.", None, {"action": "fallback"}
+    async def _get_paper(self, arxiv_id: str) -> Optional[Paper]:
+        """
+        Current client method is get_paper(arxiv_id=...).
+        Keep a fallback for older client versions that used paper(...).
+        """
+        try:
+            if hasattr(self.arxiv, "get_paper"):
+                return await self.arxiv.get_paper(arxiv_id=arxiv_id)  # type: ignore[attr-defined]
+            return await self.arxiv.paper(arxiv_id=arxiv_id)  # type: ignore[attr-defined]
+        except httpx.HTTPError:
+            return None
 
     # -----------------------
     # LLM routing
     # -----------------------
     def _intent_from_llm(self, state: SessionState, msg: str) -> Dict[str, Any]:
         """
-        Returns STRICT JSON only:
-        - search: {action:"search", query:"...", start:0, max_results:10}
-        - next:   {action:"next"}
-        - open:   {action:"open", index:3}
-        - paper:  {action:"paper", arxiv_id:"2401.01234"}
+        Returns STRICT JSON only (no markdown, no extra keys):
+
+        - help:  {"action":"help"}
+        - reset: {"action":"reset"}
+        - search:{"action":"search","query":"...","start":0,"max_results":10}
+        - next:  {"action":"next"}
+        - open:  {"action":"open","index":3}
+        - paper: {"action":"paper","arxiv_id":"2401.01234"}
         """
+
+        # Context for references like “open the 9th one”
+        last_results = state.last_results or []
+        preview_lines: List[str] = []
+        for i, p in enumerate(last_results[:25], start=1):
+            preview_lines.append(f"{i}) {p.title} — {p.arxiv_id}")
+        preview = "\n".join(preview_lines) if preview_lines else "(none)"
+
         system = (
             "You are an intent router for an arXiv chatbot.\n"
-            "Return ONLY valid JSON. No markdown.\n\n"
-            "Actions:\n"
-            "1) search: user wants papers on a topic\n"
-            "2) next: next page of last search\n"
-            "3) open: open Nth paper from last results\n"
-            "4) paper: fetch paper by explicit arXiv id\n\n"
-            "Rules:\n"
-            "- If user says 'next' or 'next page' => {\"action\":\"next\"}\n"
-            "- If user says 'open 3' => {\"action\":\"open\",\"index\":3}\n"
-            "- If user says 'paper 2401.01234' or message looks like an arXiv id => action=paper\n"
-            "- Otherwise treat message as a search query: action=search with query=message\n"
-            "- Default start=0 and max_results=10 for searches.\n"
+            "Return ONLY a single JSON object. No markdown. No commentary.\n"
+            "Use EXACTLY one of these actions: help, reset, search, next, open, paper.\n\n"
+            "State (may be empty):\n"
+            f"- last_query: {state.last_query!r}\n"
+            f"- last_start: {state.last_start}\n"
+            f"- page_size: {state.page_size}\n"
+            f"- last_results_count: {len(last_results)}\n"
+            "- last_results_preview (1-indexed):\n"
+            f"{preview}\n\n"
+            "Output JSON schema (no extra keys):\n"
+            "- help  => {\"action\":\"help\"}\n"
+            "- reset => {\"action\":\"reset\"}\n"
+            "- next  => {\"action\":\"next\"}\n"
+            "- open  => {\"action\":\"open\",\"index\":<int>}\n"
+            "- paper => {\"action\":\"paper\",\"arxiv_id\":\"<id>\"}\n"
+            "- search=> {\"action\":\"search\",\"query\":\"<topic>\",\"start\":<int>,\"max_results\":<int>}\n\n"
+            "Routing rules:\n"
+            "1) If user asks for help/commands/examples => action=help.\n"
+            "2) If user asks to reset/clear/start over => action=reset.\n"
+            "3) If user asks for next page / more results / continue => action=next.\n"
+            "4) If user asks to open/show/display a specific item from the last results by number or ordinal\n"
+            "   (e.g., 'open 9', 'open the ninth paper', 'show me the 3rd one') => action=open with that index.\n"
+            "5) If user provides an explicit arXiv id (e.g., 2401.01234 or 2103.14954) or says 'paper <id>' => action=paper.\n"
+            "6) Otherwise treat the message as a search request => action=search with query=the message.\n\n"
+            "Defaults for search: start=0, max_results=10 unless user explicitly requests another page size.\n"
+            "If last_results_count is 0 and user asks to open, return action=help instead of guessing.\n"
         )
 
         messages = [
@@ -277,44 +265,89 @@ class ChatService:
 
         raw = self.llm.chat(messages, temperature=0.0).strip()
 
+        data = self._safe_json_object(raw)
+        if isinstance(data, dict) and "action" in data:
+            if data["action"] == "search":
+                data.setdefault("start", 0)
+                data.setdefault("max_results", 10)
+                data.setdefault("query", msg)
+            return data
+
+        # Safe fallback if parsing fails
+        return {"action": "search", "query": msg, "start": 0, "max_results": 10}
+
+    def _safe_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Best-effort JSON object parser without regex.
+        Extracts the first top-level JSON object by brace scanning.
+        """
+        if not text:
+            return None
+
+        text = text.strip()
+
+        # Fast path: whole string is JSON
         try:
-            data = json.loads(raw)
-            if isinstance(data, dict) and "action" in data:
-                # normalize minimal fields
-                if data["action"] == "search":
-                    data.setdefault("start", 0)
-                    data.setdefault("max_results", 10)
-                    # Some models may forget to include "query" even for search.
-                    data.setdefault("query", msg)
-                return data
+            obj = json.loads(text)
+            return obj if isinstance(obj, dict) else None
         except Exception:
             pass
 
-        # safe fallback
-        return {"action": "search", "query": msg, "start": 0, "max_results": 10}
+        start = text.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        return obj if isinstance(obj, dict) else None
+                    except Exception:
+                        return None
+
+        return None
 
     # -----------------------
     # Formatting helpers
     # -----------------------
-    def _format_search_reply(self, query: str, start: int, papers: List[Paper]) -> str:
+    def _format_search_results(self, query: str, start: int, papers: List[Paper]) -> str:
         if not papers:
-            return f"No results for **{query}**. Try a different phrase."
+            return f"No results found for **{query}**."
 
         lines = [f"Showing {len(papers)} results for **{query}** (start={start}):"]
         for i, p in enumerate(papers, start=1):
             lines.append(f"{i}) {p.title} — {p.arxiv_id}")
-        lines.append("\nSay `open 1` (or any number), or `next`.")
         return "\n".join(lines)
 
-    def _format_paper(self, p: Paper) -> str:
-        authors = ", ".join(p.authors) if p.authors else "Unknown"
-        pdf = p.pdf_url or "N/A"
+    def _format_paper_detail(self, p: Paper) -> str:
+        authors = ", ".join(p.authors or [])
         abstract = (p.abstract or "").strip()
-        return (
-            f"**{p.title}**\n"
-            f"arXiv: {p.arxiv_id}\n"
-            f"Authors: {authors}\n\n"
-            f"{abstract}\n\n"
-            f"PDF: {pdf}\n\n"
-            f"(Later: download → vector DB → chat-with-PDF will be handled by arxiv_backend.)"
-        )
+        return f"**{p.title}**\narXiv: {p.arxiv_id}\nAuthors: {authors}\n\n{abstract}"
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default

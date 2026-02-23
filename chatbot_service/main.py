@@ -53,7 +53,7 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    reply, results, meta = await chat_service.handle(req.session_id, req.message)
+    reply, results, meta = await chat_service.handle_message(req.session_id, req.message)
     return ChatResponse(session_id=req.session_id, reply=reply, results=results, meta=meta)
 
 
