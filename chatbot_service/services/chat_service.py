@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -54,6 +56,7 @@ class ChatService:
         action = (intent.get("action") or "chat").strip().lower()
         topic = (intent.get("topic") or "").strip()
         index = intent.get("index", None)
+        title = (intent.get("title") or "").strip()
         arxiv_id = (intent.get("arxiv_id") or "").strip()
         chat_response = (intent.get("chat_response") or "").strip()
 
@@ -82,13 +85,21 @@ class ChatService:
             return await self._do_next(state)
 
         if action == "open":
-            if index is None:
-                return "Usage: `open 5` (opens the 5th paper on the current page).", [], self._meta(state)
-            try:
-                idx_int = int(index)
-            except Exception:
-                return "Usage: `open 5` (opens the 5th paper on the current page).", [], self._meta(state)
-            return await self._do_open_index(state, idx_int)
+            # Prefer explicit index when provided
+            if index is not None:
+                try:
+                    idx_int = int(index)
+                except Exception:
+                    idx_int = None
+                if idx_int is None:
+                    return "Usage: `open 5` or `open <title>`", [], self._meta(state)
+                return await self._do_open_index(state, idx_int)
+
+            # Otherwise try open-by-title
+            if title:
+                return await self._do_open_title(state, title)
+
+            return "Usage: `open 5` or `open <title>`", [], self._meta(state)
 
         if action == "paper":
             if not arxiv_id:
@@ -140,11 +151,9 @@ class ChatService:
     async def _do_next(self, state) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         next_start = state.cursor_start + state.page_size
 
-        # If total known and we're already at/over end
         if state.total_results is not None and next_start >= state.total_results:
             return "No more results.", [], self._meta(state)
 
-        # Ensure enough results are loaded locally for the next page
         needed = next_start + state.page_size
         print(
             f"[CHATBOT] next requested -> cursor={state.cursor_start} "
@@ -152,7 +161,6 @@ class ChatService:
         )
         await self._ensure_loaded(state, needed=needed)
 
-        # If still not enough (e.g., backend returned fewer than requested)
         if next_start >= len(state.prefetched_results):
             return "No more results.", [], self._meta(state)
 
@@ -172,7 +180,7 @@ class ChatService:
         self, state, idx: int
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         """
-        LLM provides idx directly (no regex). Behavior:
+        Behavior:
         - If idx fits within current page (state.last_results): open that.
         - Else treat idx as global index across entire search and load as needed.
         """
@@ -196,6 +204,118 @@ class ChatService:
         paper = state.prefetched_results[global_index]
         return self._format_paper_reply(paper), [paper], self._meta(state)
 
+    async def _do_open_title(
+        self, state, raw_title: str
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """Open a paper by (approximate) title.
+
+        Matching strategy (in order):
+        1) Exact normalized title match within currently loaded cache.
+        2) Substring match (query contained in title).
+        3) Fuzzy match (difflib ratio) within loaded cache.
+
+        If not found and more results may exist, progressively load more chunks
+        (up to hard_total_cap / known total) and retry.
+        """
+        query = (raw_title or "").strip()
+        if not query:
+            return "Usage: `open <title>`", [], self._meta(state)
+
+        max_rounds = 5
+        for _ in range(max_rounds):
+            paper, candidates = self._find_best_title_match(state, query)
+            if paper is not None:
+                return self._format_paper_reply(paper), [paper], self._meta(state)
+
+            if candidates:
+                lines = [
+                    "I found multiple close title matches. Reply with `open <number>` or paste the exact title:",
+                ]
+                for i, p in enumerate(candidates[:5], start=1):
+                    t = str(p.get("title") or "").strip()
+                    pid = str(p.get("arxiv_id") or p.get("id") or "").strip()
+                    lines.append(f"{i}) {t} — {pid}")
+                return "\n".join(lines), candidates[:5], self._meta(state)
+
+            if state.total_results is not None and len(state.prefetched_results) >= state.total_results:
+                break
+            if len(state.prefetched_results) >= self.hard_total_cap:
+                break
+
+            await self._ensure_loaded(state, needed=len(state.prefetched_results) + self.prefetch_chunk_size)
+
+        return (
+            "Couldn't find a paper with that title in the current search results. "
+            "Tip: try `next` to browse, or use `paper <arxiv_id>` if you have it.",
+            [],
+            self._meta(state),
+        )
+
+    # -----------------------------
+    # Title matching helpers
+    # -----------------------------
+    _WS_RE = re.compile(r"\s+")
+    _PUNCT_RE = re.compile(r"[^a-z0-9\s]")
+
+    def _normalize_title(self, s: str) -> str:
+        s = (s or "").strip().lower()
+        s = self._WS_RE.sub(" ", s)
+        s = self._PUNCT_RE.sub(" ", s)
+        s = self._WS_RE.sub(" ", s).strip()
+        return s
+
+    def _find_best_title_match(
+        self, state, query: str
+    ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        qn = self._normalize_title(query)
+        if not qn:
+            return None, []
+
+        hay = state.prefetched_results or []
+        if not hay:
+            return None, []
+
+        # 1) Exact match
+        for p in hay:
+            tn = self._normalize_title(str(p.get("title") or ""))
+            if tn and tn == qn:
+                return p, []
+
+        # 2) Substring match
+        substring_matches: List[Dict[str, Any]] = []
+        for p in hay:
+            tn = self._normalize_title(str(p.get("title") or ""))
+            if tn and qn in tn:
+                substring_matches.append(p)
+        if len(substring_matches) == 1:
+            return substring_matches[0], []
+        if len(substring_matches) > 1:
+            return None, substring_matches
+
+        # 3) Fuzzy match
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for p in hay:
+            tn = self._normalize_title(str(p.get("title") or ""))
+            if not tn:
+                continue
+            score = difflib.SequenceMatcher(a=qn, b=tn).ratio()
+            scored.append((score, p))
+
+        if not scored:
+            return None, []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_paper = scored[0]
+
+        if best_score >= 0.82:
+            return best_paper, []
+
+        candidates: List[Dict[str, Any]] = [p for s, p in scored[:5] if s >= 0.72]
+        if candidates:
+            return None, candidates
+
+        return None, []
+
     async def _do_paper(
         self, state, arg: str
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
@@ -203,8 +323,6 @@ class ChatService:
         if not arxiv_id:
             return "Usage: `paper <arxiv_id>` (example: `paper 2003.10303`)", [], self._meta(state)
 
-        # Delegate to backend if you have a "paper" endpoint; otherwise reuse open-from-cache if present.
-        # We'll attempt backend first (more reliable).
         try:
             paper = await self.arxiv.get_paper(arxiv_id)
             if not paper:
@@ -214,7 +332,6 @@ class ChatService:
             return self._format_paper_reply(paper_dict), [paper_dict], self._meta(state)
 
         except Exception:
-            # Fallback: search within cached results
             for p in state.prefetched_results:
                 pid = str(p.get("arxiv_id") or p.get("id") or "")
                 if pid == arxiv_id:
@@ -225,30 +342,20 @@ class ChatService:
     # Progressive prefetch (chunking)
     # -----------------------------
     async def _ensure_loaded(self, state, needed: int) -> None:
-        """
-        Ensure at least `needed` items exist in state.prefetched_results.
-        Fetch additional chunks from backend only if required.
-        """
         if needed <= len(state.prefetched_results):
             return
 
-        # Don’t load beyond safety cap
         if len(state.prefetched_results) >= self.hard_total_cap:
             return
 
-        # If total is known, don’t load beyond it
         if state.total_results is not None and len(state.prefetched_results) >= state.total_results:
             return
 
-        # Fetch chunks until we satisfy `needed` or cannot fetch more
         while len(state.prefetched_results) < needed:
             start = len(state.prefetched_results)
-
-            # Determine how much to request this round
             remaining_cap = self.hard_total_cap - start
             chunk = min(self.prefetch_chunk_size, remaining_cap)
 
-            # If total known, also cap to remaining total
             if state.total_results is not None:
                 remaining_total = max(0, state.total_results - start)
                 chunk = min(chunk, remaining_total)
@@ -262,28 +369,18 @@ class ChatService:
                 max_results=chunk,
             )
 
-            # Update total if backend provides it
             if state.total_results is None and total is not None:
                 state.total_results = total
 
-            # If backend returns nothing, stop
             if not fetched:
                 return
 
             state.prefetched_results.extend(fetched)
 
-            # If backend returned fewer than requested, likely end reached
             if len(fetched) < chunk:
                 return
 
     def _paper_to_dict(self, p: Any) -> Dict[str, Any]:
-        """
-        Normalize backend/client objects to dict so `.get()` works everywhere.
-        Supports:
-          - dict
-          - Pydantic v2 models (model_dump)
-          - Pydantic v1 models (dict)
-        """
         if isinstance(p, dict):
             return p
 
@@ -307,17 +404,12 @@ class ChatService:
     async def _fetch_from_backend(
         self, topic: str, start: int, max_results: int
     ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-        """
-        We keep it defensive so your existing backend response shape still works.
-        Also normalizes results into dicts (Paper -> dict).
-        """
         print(f"[CHATBOT] backend.search(topic={topic!r}, start={start}, max_results={max_results})")
         resp = await self.arxiv.search(topic=topic, start=start, max_results=max_results)
 
         if resp is None:
             return [], None
 
-        # dict response: {"results": [...], "total_results": 1234, ...}
         if isinstance(resp, dict):
             raw_results = resp.get("results") or resp.get("items") or resp.get("papers") or []
             total = resp.get("total_results") or resp.get("total") or resp.get("count")
@@ -332,7 +424,6 @@ class ChatService:
             results = [self._paper_to_dict(p) for p in raw_results]
             return results, total
 
-        # list response: [Paper|dict...]
         if isinstance(resp, list):
             results = [self._paper_to_dict(p) for p in resp]
             return results, None
@@ -347,14 +438,6 @@ class ChatService:
         return state.prefetched_results[start:end]
 
     def _format_published_date(self, p: Dict[str, Any]) -> str:
-        """
-        Returns YYYY-MM-DD if possible, else "".
-        Handles common keys and common shapes:
-          - "published": "2024-06-27T18:00:00Z"
-          - "published": {"date": "..."} (rare)
-          - "published_date": "..."
-          - "created": "..." (some clients)
-        """
         val = (
             p.get("published")
             or p.get("published_date")
@@ -363,7 +446,6 @@ class ChatService:
             or ""
         )
 
-        # Sometimes nested dicts happen
         if isinstance(val, dict):
             val = val.get("date") or val.get("value") or ""
 
@@ -374,11 +456,9 @@ class ChatService:
         if not val:
             return ""
 
-        # Convert ISO -> YYYY-MM-DD
         if "T" in val:
             return val.split("T", 1)[0].strip()
 
-        # Already date-like
         return val[:10].strip()
 
     def _format_authors(self, p: Dict[str, Any], max_authors: int = 6) -> str:
@@ -410,7 +490,6 @@ class ChatService:
         lines.append(f"Showing {shown_from}-{shown_to} of {total_str} for **{state.current_query}** {note}".strip())
         lines.append(f"(loaded in session cache: {loaded})")
 
-        # IMPORTANT: Do NOT show arXiv id here
         for i, p in enumerate(page, start=1):
             title = (p.get("title") or "").strip() or "Untitled"
             authors_str = self._format_authors(p, max_authors=6)
@@ -432,7 +511,6 @@ class ChatService:
     def _format_paper_reply(self, p: Dict[str, Any]) -> str:
         title = (p.get("title") or "").strip() or "Untitled"
 
-        # IMPORTANT: Do NOT show arXiv id in the detailed view either
         authors_str = self._format_authors(p, max_authors=8)
         published = self._format_published_date(p)
 
@@ -459,6 +537,7 @@ class ChatService:
             "- `search <topic>`\n"
             "- `next`\n"
             "- `open <n>` (opens the nth paper on current page; if not on page, tries nth overall)\n"
+            "- `open <title>` (opens the best matching paper title from current search)\n"
             "- `paper <arxiv_id>`\n"
         )
 

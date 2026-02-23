@@ -18,6 +18,7 @@ Schema:
   "action": "search" | "open" | "next" | "help" | "reset" | "paper" | "chat",
   "topic": string,
   "index": integer or null,
+  "title": string,
   "arxiv_id": string,
   "chat_response": string
 }
@@ -32,6 +33,7 @@ Rules:
       "action": "search",
       "topic": "ai in healthcare",
       "index": null,
+      "title": "",
       "arxiv_id": "",
       "chat_response": ""
     }
@@ -43,6 +45,20 @@ Rules:
 
 - If user says "open 5" or "show me the 2nd paper",
   action="open" and index=number (1-based).
+
+- If user says "open <TITLE>" or "show me the paper titled <TITLE>",
+  action="open" and title=<TITLE> (and index=null).
+  Examples:
+    Input: "open Responsible AI in Healthcare"
+    Output:
+    {
+      "action": "open",
+      "topic": "",
+      "index": null,
+      "title": "Responsible AI in Healthcare",
+      "arxiv_id": "",
+      "chat_response": ""
+    }
 
 - If user says "paper 2103.14954",
   action="paper" and arxiv_id="2103.14954".
@@ -89,7 +105,7 @@ class LLMClient:
         return resp.choices[0].message.content or ""
 
     # ---------------------------------------------------
-    # NEW: Intent + topic extraction (LLM-only routing)
+    # Intent + slot extraction
     # ---------------------------------------------------
     def parse_intent(
         self,
@@ -102,6 +118,7 @@ class LLMClient:
                 "action": "chat",
                 "topic": "",
                 "index": None,
+                "title": "",
                 "arxiv_id": "",
                 "chat_response": "LLM not configured properly.",
             }
@@ -118,7 +135,7 @@ class LLMClient:
                 {"role": "system", "content": _INTENT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.0,  # deterministic extraction
+            temperature=0.0,
         )
 
         data = self._safe_parse_json(raw)
@@ -129,6 +146,7 @@ class LLMClient:
             action = "chat"
 
         topic = str(data.get("topic") or "").strip()
+        title = str(data.get("title") or "").strip()
         arxiv_id = str(data.get("arxiv_id") or "").strip()
         chat_response = str(data.get("chat_response") or "").strip()
 
@@ -144,6 +162,7 @@ class LLMClient:
             "action": action,
             "topic": topic,
             "index": index,
+            "title": title,
             "arxiv_id": arxiv_id,
             "chat_response": chat_response,
         }
@@ -156,13 +175,11 @@ class LLMClient:
         if not text:
             return {}
 
-        # direct parse
         try:
             return json.loads(text)
         except Exception:
             pass
 
-        # try extracting JSON object from noisy output
         m = _JSON_RE.search(text)
         if not m:
             return {}
