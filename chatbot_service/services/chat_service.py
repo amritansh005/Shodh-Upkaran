@@ -38,6 +38,7 @@ class ChatService:
     # -----------------------------
     # Public entrypoint (LLM-only routing)
     # -----------------------------
+
     async def handle_message(
         self, session_id: str, message: str
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
@@ -47,7 +48,7 @@ class ChatService:
         if not msg:
             return "Say something 🙂 (try: `search ai in healthcare`)", [], self._meta(state)
 
-        # LLM-only routing + slot extraction (NO REGEX)
+        # LLM routing + slot extraction
         intent = self.llm.parse_intent(
             user_message=msg,
             session_state=self._meta(state),
@@ -63,6 +64,27 @@ class ChatService:
         title = (intent.get("title") or "").strip()
         arxiv_id = (intent.get("arxiv_id") or "").strip()
         chat_response = (intent.get("chat_response") or "").strip()
+
+        # -----------------------------
+        # Session-first resolution (confidence thresholds)
+        # If a list is on screen (active results context), interpret OPEN/READ requests
+        # as selecting from that list first. Only run a new SEARCH if the current list
+        # has zero reasonable candidates for what the user asked.
+        # -----------------------------
+        has_arc = bool(state.current_query) and bool(state.last_results or state.prefetched_results)
+        looks_like_open = self._looks_like_open_request(msg)
+
+        if has_arc and action == "search" and looks_like_open:
+            # LLM may misclassify "open the paper by X" as a SEARCH (author search).
+            # Prefer opening from the current list first.
+            return await self._do_open_from_context(state, intent, user_message=msg)
+
+        if has_arc and action == "open":
+            # If OPEN action lacks index/title/arxiv_id but includes selectors, resolve against current list.
+            if index is None and not title and not arxiv_id and (
+                author or topic or (from_year is not None) or (to_year is not None) or categories
+            ):
+                return await self._do_open_from_context(state, intent, user_message=msg)
 
         if action == "help":
             return self._help_text(), [], self._meta(state)
@@ -118,6 +140,10 @@ class ChatService:
             if title:
                 return await self._do_open_title(state, title)
 
+            # If no title/index but user wrote an open-like message, try context resolution
+            if has_arc and looks_like_open:
+                return await self._do_open_from_context(state, intent, user_message=msg)
+
             return "Usage: `open 5` or `open <title>`", [], self._meta(state)
 
         if action == "paper":
@@ -133,10 +159,6 @@ class ChatService:
 
         # Safety fallback
         return "Unknown request. Type `help` to see allowed actions.", [], self._meta(state)
-
-    # -----------------------------
-    # Core behaviors
-    # -----------------------------
     async def _do_search(
         self,
         state,
@@ -296,8 +318,372 @@ class ChatService:
         )
 
     # -----------------------------
-    # Title matching helpers
+    # Session-first OPEN resolution (no new search unless needed)
     # -----------------------------
+    _OPEN_VERBS = (
+        "open",
+        "read",
+        "show me",
+        "show",
+        "details",
+        "summarize",
+        "summary",
+        "explain",
+        "tell me about",
+    )
+
+    def _looks_like_open_request(self, msg: str) -> bool:
+        m = (msg or "").strip().lower()
+        if not m:
+            return False
+        # Require an open/read/details cue so normal "papers by X" stays SEARCH.
+        return any(v in m for v in self._OPEN_VERBS)
+
+    def _wants_show_all(self, msg: str) -> bool:
+        m = (msg or "").lower()
+        return ("show all" in m) or ("list all" in m) or ("all matches" in m)
+
+    def _wants_choose_one(self, msg: str) -> bool:
+        m = (msg or "").lower()
+        return ("choose one" in m) or ("pick one" in m) or ("you choose" in m) or ("just choose" in m)
+
+    def _paper_year(self, p: Dict[str, Any]) -> Optional[int]:
+        d = self._format_published_date(p)
+        if d and len(d) >= 4 and d[:4].isdigit():
+            try:
+                return int(d[:4])
+            except Exception:
+                return None
+        return None
+
+    def _author_match(self, p: Dict[str, Any], author_q: str) -> bool:
+        aq = (author_q or "").strip().lower()
+        if not aq:
+            return True
+        auth = p.get("authors") or p.get("author") or ""
+        if isinstance(auth, list):
+            blob = " ".join([str(x) for x in auth])
+        else:
+            blob = str(auth)
+        return aq in blob.lower()
+
+    def _topic_match(self, p: Dict[str, Any], topic_q: str) -> bool:
+        tq = (topic_q or "").strip().lower()
+        if not tq:
+            return True
+        title = str(p.get("title") or "").lower()
+        summ = str(p.get("summary") or p.get("abstract") or "").lower()
+        return (tq in title) or (tq in summ)
+
+    def _year_match(self, p: Dict[str, Any], from_year: Optional[int], to_year: Optional[int]) -> bool:
+        if from_year is None and to_year is None:
+            return True
+        y = self._paper_year(p)
+        if y is None:
+            return False
+        if from_year is not None and y < int(from_year):
+            return False
+        if to_year is not None and y > int(to_year):
+            return False
+        return True
+
+    def _filter_candidates(
+        self,
+        papers: List[Dict[str, Any]],
+        *,
+        author: str,
+        topic: str,
+        from_year: Optional[int],
+        to_year: Optional[int],
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for p in papers:
+            if not self._author_match(p, author):
+                continue
+            if not self._year_match(p, from_year, to_year):
+                continue
+            if not self._topic_match(p, topic):
+                continue
+            out.append(p)
+        return out
+
+    def _title_best_in(
+        self, papers: List[Dict[str, Any]], query: str
+    ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        qn = self._normalize_title(query)
+        if not qn:
+            return None, []
+
+        # 1) Exact
+        for p in papers:
+            tn = self._normalize_title(str(p.get("title") or ""))
+            if tn and tn == qn:
+                return p, []
+
+        # 2) Substring
+        subs: List[Dict[str, Any]] = []
+        for p in papers:
+            tn = self._normalize_title(str(p.get("title") or ""))
+            if tn and qn in tn:
+                subs.append(p)
+        if len(subs) == 1:
+            return subs[0], []
+        if len(subs) > 1:
+            return None, subs
+
+        # 3) Fuzzy
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for p in papers:
+            tn = self._normalize_title(str(p.get("title") or ""))
+            if not tn:
+                continue
+            score = difflib.SequenceMatcher(a=qn, b=tn).ratio()
+            scored.append((score, p))
+        if not scored:
+            return None, []
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_paper = scored[0]
+        if best_score >= 0.82:
+            return best_paper, []
+
+        cands = [p for s, p in scored[:10] if s >= 0.72]
+        if cands:
+            return None, cands
+        return None, []
+
+    def _indices_for_candidates(
+        self, state, candidates: List[Dict[str, Any]]
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        # Prefer page indices if candidate is in last_results; else global indices.
+        out: List[Tuple[int, Dict[str, Any]]] = []
+        last = state.last_results or []
+        # map arxiv_id to index on current page
+        page_map: Dict[str, int] = {}
+        for i, p in enumerate(last):
+            pid = str(p.get("arxiv_id") or p.get("id") or "")
+            if pid:
+                page_map[pid] = i + 1
+
+        for p in candidates:
+            pid = str(p.get("arxiv_id") or p.get("id") or "")
+            if pid and pid in page_map:
+                out.append((page_map[pid], p))
+                continue
+            # fallback to loaded index
+            try:
+                gi = state.prefetched_results.index(p)
+                out.append((gi + 1, p))
+            except Exception:
+                out.append((0, p))
+        return out
+
+    def _format_candidate_choices(
+        self,
+        state,
+        candidates: List[Dict[str, Any]],
+        header: str,
+        limit: int = 10,
+    ) -> str:
+        pairs = self._indices_for_candidates(state, candidates)
+        lines = [header]
+        for n, (idx, p) in enumerate(pairs):
+            if n >= limit:
+                break
+            t = str(p.get("title") or "").strip()
+            a_str = self._format_authors(p, max_authors=6)
+            d = self._format_published_date(p)
+            prefix = f"{idx}) " if idx else "- "
+            meta_bits: List[str] = []
+            if a_str:
+                meta_bits.append(f"Authors: {a_str}")
+            if d:
+                meta_bits.append(f"Published: {d}")
+            if meta_bits:
+                lines.append(f"{prefix}{t}\n   " + " | ".join(meta_bits))
+            else:
+                lines.append(f"{prefix}{t}")
+        return "\n".join(lines)
+
+    async def _do_open_from_context(
+        self,
+        state,
+        intent: Dict[str, Any],
+        user_message: str,
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """Resolve an OPEN-like request using the current list first (confidence thresholds).
+
+        - Try within current page (state.last_results) first.
+        - Then try within all loaded results (state.prefetched_results).
+        - Only if zero reasonable candidates exist, suggest a new search (do not auto-search).
+        """
+        author = str(intent.get("author") or "").strip()
+        topic = str(intent.get("topic") or "").strip()
+        title = str(intent.get("title") or "").strip()
+        from_year = intent.get("from_year", None)
+        to_year = intent.get("to_year", None)
+        arxiv_id = str(intent.get("arxiv_id") or "").strip()
+        index = intent.get("index", None)
+
+        # If user provided an index or arXiv id, defer to explicit handlers.
+        if index is not None:
+            try:
+                return await self._do_open_index(state, int(index))
+            except Exception:
+                pass
+        if arxiv_id:
+            return await self._do_paper(state, arxiv_id)
+
+        page_view = state.last_results or []
+        loaded = state.prefetched_results or []
+
+        # Title-based selection (page-first, then loaded)
+        if title:
+            paper, cands = self._title_best_in(page_view, title)
+            if paper is not None:
+                return self._format_paper_reply(paper), [paper], self._meta(state)
+
+            if cands:
+                if self._wants_show_all(user_message):
+                    txt = self._format_candidate_choices(
+                        state,
+                        cands,
+                        header="Matches in the current page (reply `open <number>`):",
+                        limit=15,
+                    )
+                    return txt, cands[:15], self._meta(state)
+
+                if self._wants_choose_one(user_message):
+                    chosen = cands[0]
+                    return self._format_paper_reply(chosen), [chosen], self._meta(state)
+
+                txt = self._format_candidate_choices(
+                    state,
+                    cands,
+                    header="I found multiple close matches in the current page. Which one should I open? Reply `open <number>`:",
+                    limit=10,
+                )
+                return txt, cands[:10], self._meta(state)
+
+            paper2, cands2 = self._title_best_in(loaded, title)
+            if paper2 is not None:
+                return self._format_paper_reply(paper2), [paper2], self._meta(state)
+
+            if cands2:
+                if self._wants_show_all(user_message):
+                    txt = self._format_candidate_choices(
+                        state,
+                        cands2,
+                        header="Matches in the current loaded results (reply `open <number>`):",
+                        limit=20,
+                    )
+                    return txt, cands2[:20], self._meta(state)
+
+                if self._wants_choose_one(user_message):
+                    chosen = cands2[0]
+                    return self._format_paper_reply(chosen), [chosen], self._meta(state)
+
+                txt = self._format_candidate_choices(
+                    state,
+                    cands2,
+                    header="I found multiple close matches in the current results. Which one should I open? Reply `open <number>`:",
+                    limit=10,
+                )
+                return txt, cands2[:10], self._meta(state)
+
+            return (
+                "I can't find that title in the current results. If you want a new search, say: `search <title>`.",
+                [],
+                self._meta(state),
+            )
+
+        # Non-title selectors (author/topic/year) — filter page first
+        page_matches = self._filter_candidates(
+            page_view,
+            author=author,
+            topic=topic,
+            from_year=from_year,
+            to_year=to_year,
+        )
+
+        if len(page_matches) == 1:
+            p = page_matches[0]
+            return self._format_paper_reply(p), [p], self._meta(state)
+
+        if len(page_matches) > 1:
+            if self._wants_show_all(user_message):
+                txt = self._format_candidate_choices(
+                    state,
+                    page_matches,
+                    header="Multiple matches in the current page (reply `open <number>`):",
+                    limit=20,
+                )
+                return txt, page_matches[:20], self._meta(state)
+
+            if self._wants_choose_one(user_message):
+                chosen = page_matches[0]
+                return self._format_paper_reply(chosen), [chosen], self._meta(state)
+
+            txt = self._format_candidate_choices(
+                state,
+                page_matches,
+                header="I found multiple matches in the current page. Which one should I open? Reply `open <number>`:",
+                limit=10,
+            )
+            return txt, page_matches[:10], self._meta(state)
+
+        # Try within loaded results
+        loaded_matches = self._filter_candidates(
+            loaded,
+            author=author,
+            topic=topic,
+            from_year=from_year,
+            to_year=to_year,
+        )
+
+        if len(loaded_matches) == 1:
+            p = loaded_matches[0]
+            return self._format_paper_reply(p), [p], self._meta(state)
+
+        if len(loaded_matches) > 1:
+            if self._wants_show_all(user_message):
+                txt = self._format_candidate_choices(
+                    state,
+                    loaded_matches,
+                    header="Multiple matches in your current results (reply `open <number>`):",
+                    limit=30,
+                )
+                return txt, loaded_matches[:30], self._meta(state)
+
+            if self._wants_choose_one(user_message):
+                chosen = loaded_matches[0]
+                return self._format_paper_reply(chosen), [chosen], self._meta(state)
+
+            txt = self._format_candidate_choices(
+                state,
+                loaded_matches,
+                header="I found multiple matches in your current results. Which one should I open? Reply `open <number>`:",
+                limit=10,
+            )
+            return txt, loaded_matches[:10], self._meta(state)
+
+        # Zero reasonable candidates in current list → suggest a new search instead of jumping to it.
+        hint_parts: List[str] = []
+        if author:
+            hint_parts.append(f"by **{author}**")
+        if topic:
+            hint_parts.append(f"about **{topic}**")
+        if from_year is not None or to_year is not None:
+            fy = str(from_year) if from_year is not None else ""
+            ty = str(to_year) if to_year is not None else ""
+            hint_parts.append(f"between **{fy}** and **{ty}**".strip())
+        hint = " ".join(hint_parts).strip() or "that"
+
+        return (
+            f"I don't see {hint} in the current results. If you want a new search, say: `search {topic or author}` (include years if needed).",
+            [],
+            self._meta(state),
+        )
     _WS_RE = re.compile(r"\s+")
     _PUNCT_RE = re.compile(r"[^a-z0-9\s]")
 

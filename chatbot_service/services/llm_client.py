@@ -27,9 +27,17 @@ Schema (ALWAYS include all fields):
   "chat_response": string
 }
 
+
 Rules:
 
+IMPORTANT CONTEXT RULE (when a list is on screen):
+- If the session state indicates there is an active search/list (e.g., last_results is non-empty),
+  and the user uses OPEN/READ language such as "open", "read", "summarize", "details", "tell me about",
+  then set action="open" and extract selectors (index/title/author/from_year/to_year/topic) from the message.
+  Do NOT set action="search" for such messages.
+
 - If user asks to search, extract search constraints:
+
   - topic (free-text topic like "ai in healthcare")
   - author if user says "by <name>" or "author <name>"
   - year range if user says "between <YYYY> and <YYYY>" or "from <YYYY> to <YYYY>"
