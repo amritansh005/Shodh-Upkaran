@@ -12,11 +12,15 @@ You are an intent and slot extractor for an arXiv research assistant chatbot.
 
 Return ONLY valid JSON. No markdown. No explanation. No extra text.
 
-Schema:
+Schema (ALWAYS include all fields):
 
 {
   "action": "search" | "open" | "next" | "help" | "reset" | "paper" | "chat",
   "topic": string,
+  "author": string,
+  "from_year": integer or null,
+  "to_year": integer or null,
+  "categories": array of strings,
   "index": integer or null,
   "title": string,
   "arxiv_id": string,
@@ -25,13 +29,21 @@ Schema:
 
 Rules:
 
-- If user asks to search, extract ONLY the topic.
+- If user asks to search, extract search constraints:
+  - topic (free-text topic like "ai in healthcare")
+  - author if user says "by <name>" or "author <name>"
+  - year range if user says "between <YYYY> and <YYYY>" or "from <YYYY> to <YYYY>"
+  - categories if user mentions arXiv category codes like "cs.AI", "cs.LG", "stat.ML", "q-bio.QM"
   Example:
-    Input: "can you search for research papers on ai in healthcare"
+    Input: "show me research papers uploaded between 2020 and 2022 on ai in healthcare"
     Output:
     {
       "action": "search",
       "topic": "ai in healthcare",
+      "author": "",
+      "from_year": 2020,
+      "to_year": 2022,
+      "categories": [],
       "index": null,
       "title": "",
       "arxiv_id": "",
@@ -41,6 +53,9 @@ Rules:
 - If user message is just a topic like "ai in healthcare",
   treat it as action="search" with topic="ai in healthcare".
 
+- If user says only an author constraint like "papers by Andrew Ng",
+  action="search", topic="" and author="Andrew Ng".
+
 - If user says "next", "more results", "next page", action="next".
 
 - If user says "open 5" or "show me the 2nd paper",
@@ -48,17 +63,6 @@ Rules:
 
 - If user says "open <TITLE>" or "show me the paper titled <TITLE>",
   action="open" and title=<TITLE> (and index=null).
-  Examples:
-    Input: "open Responsible AI in Healthcare"
-    Output:
-    {
-      "action": "open",
-      "topic": "",
-      "index": null,
-      "title": "Responsible AI in Healthcare",
-      "arxiv_id": "",
-      "chat_response": ""
-    }
 
 - If user says "paper 2103.14954",
   action="paper" and arxiv_id="2103.14954".
@@ -69,10 +73,12 @@ Rules:
 
 - Otherwise action="chat" and provide short friendly chat_response.
 
-ALWAYS include all fields.
-Use empty string "" for missing strings.
-Use null for missing index.
+Field defaults:
+- Use empty string "" for missing strings.
+- Use null for missing integers.
+- Use [] for missing categories.
 """
+
 
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -117,6 +123,10 @@ class LLMClient:
             return {
                 "action": "chat",
                 "topic": "",
+                "author": "",
+                "from_year": None,
+                "to_year": None,
+                "categories": [],
                 "index": None,
                 "title": "",
                 "arxiv_id": "",
@@ -146,6 +156,28 @@ class LLMClient:
             action = "chat"
 
         topic = str(data.get("topic") or "").strip()
+        author = str(data.get("author") or "").strip()
+
+        fy_raw = data.get("from_year", None)
+        ty_raw = data.get("to_year", None)
+        from_year = None
+        to_year = None
+        if fy_raw is not None:
+            try:
+                from_year = int(fy_raw)
+            except Exception:
+                from_year = None
+        if ty_raw is not None:
+            try:
+                to_year = int(ty_raw)
+            except Exception:
+                to_year = None
+
+        categories = data.get("categories") or []
+        if not isinstance(categories, list):
+            categories = []
+        categories = [str(c).strip() for c in categories if str(c).strip()]
+
         title = str(data.get("title") or "").strip()
         arxiv_id = str(data.get("arxiv_id") or "").strip()
         chat_response = str(data.get("chat_response") or "").strip()
@@ -161,6 +193,10 @@ class LLMClient:
         return {
             "action": action,
             "topic": topic,
+            "author": author,
+            "from_year": from_year,
+            "to_year": to_year,
+            "categories": categories,
             "index": index,
             "title": title,
             "arxiv_id": arxiv_id,

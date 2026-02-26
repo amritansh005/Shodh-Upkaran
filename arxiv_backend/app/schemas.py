@@ -7,7 +7,23 @@ SortOrder = Literal["ascending", "descending"]
 
 
 class SearchRequest(BaseModel):
-    topic: str = Field(..., min_length=2, description="Search topic, e.g., 'ai for healthcare'")
+    # Free-text topic (optional). If provided, we search in title+abstract (ti/abs).
+    # If omitted, you can still search by author/date/category alone.
+    topic: Optional[str] = Field(
+        default=None,
+        description="Search topic, e.g., 'ai for healthcare' (optional if other filters are set)",
+    )
+
+    # Optional structured filters
+    author: Optional[str] = Field(
+        default=None,
+        description='Author name filter, e.g., "Andrew Ng" (maps to arXiv au:"...")',
+    )
+
+    # Year-only ranges (inclusive). We convert to submittedDate range.
+    from_year: Optional[int] = Field(default=None, ge=1900, le=2100, description="Start year (inclusive)")
+    to_year: Optional[int] = Field(default=None, ge=1900, le=2100, description="End year (inclusive)")
+
     max_results: int = Field(10, ge=1, le=500, description="Number of results to return (1-500)")
     start: int = Field(0, ge=0, description="Pagination offset")
     sort_by: SortBy = Field("relevance", description="arXiv sort option")

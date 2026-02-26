@@ -111,7 +111,23 @@ class QueryNormalizer:
         return ",".join(cleaned)
 
     @classmethod
-    def normalize_arxiv_id(cls, arxiv_id: str) -> str:
+    
+    @classmethod
+    def normalize_author(cls, author: Optional[str]) -> str:
+        a = (author or "").strip().lower()
+        a = a.replace('"', "").replace("'", "")
+        a = cls._space_re.sub(" ", a)
+        return a
+
+    @classmethod
+    def normalize_year_range(cls, from_year: Optional[int], to_year: Optional[int]) -> str:
+        fy = "" if from_year is None else str(int(from_year))
+        ty = "" if to_year is None else str(int(to_year))
+        if not fy and not ty:
+            return ""
+        return f"{fy}-{ty}"
+
+def normalize_arxiv_id(cls, arxiv_id: str) -> str:
         # accept "arxiv:xxxx", "xxxxv2", "http://arxiv.org/abs/xxxxv2"
         s = (arxiv_id or "").strip().lower()
 

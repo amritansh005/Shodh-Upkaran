@@ -55,6 +55,10 @@ class ChatService:
 
         action = (intent.get("action") or "chat").strip().lower()
         topic = (intent.get("topic") or "").strip()
+        author = (intent.get("author") or "").strip()
+        from_year = intent.get("from_year", None)
+        to_year = intent.get("to_year", None)
+        categories = intent.get("categories") or []
         index = intent.get("index", None)
         title = (intent.get("title") or "").strip()
         arxiv_id = (intent.get("arxiv_id") or "").strip()
@@ -69,9 +73,24 @@ class ChatService:
             return "Reset done. You can `search <topic>` again.", [], self._meta(state)
 
         if action == "search":
-            if not topic:
-                return "Please provide a topic. Example: `search ai in healthcare`", [], self._meta(state)
-            return await self._do_search(state, topic)
+            if not topic and not author and not categories and from_year is None and to_year is None:
+                return (
+                    "Please provide at least one search constraint. Examples:\n"
+                    "- `ai in healthcare`\n"
+                    "- `papers by Andrew Ng`\n"
+                    "- `ai in healthcare between 2020 and 2022`\n"
+                    "- `cs.AI papers between 2020 and 2022`",
+                    [],
+                    self._meta(state),
+                )
+            return await self._do_search(
+                state,
+                topic=topic,
+                author=author,
+                from_year=from_year,
+                to_year=to_year,
+                categories=categories,
+            )
 
         # The remaining actions require an active search context
         if action in ("next", "open", "paper") and not state.current_query:
@@ -119,9 +138,30 @@ class ChatService:
     # Core behaviors
     # -----------------------------
     async def _do_search(
-        self, state, query: str
+        self,
+        state,
+        topic: str,
+        author: str = "",
+        from_year: Optional[int] = None,
+        to_year: Optional[int] = None,
+        categories: Optional[List[str]] = None,
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
-        state.current_query = query.strip()
+        # Human-readable label for the active search (used by NEXT/OPEN context)
+        state.current_query = self._describe_search(
+            topic=topic,
+            author=author,
+            from_year=from_year,
+            to_year=to_year,
+            categories=categories,
+        )
+        # Keep structured search inputs as well
+        state.meta["search"] = {
+            "topic": (topic or "").strip(),
+            "author": (author or "").strip(),
+            "from_year": from_year,
+            "to_year": to_year,
+            "categories": categories or [],
+        }
         state.cursor_start = 0
         state.page_size = self.page_size_default
         state.total_results = None
@@ -130,7 +170,11 @@ class ChatService:
 
         # Initial prefetch
         fetched, total = await self._fetch_from_backend(
-            topic=state.current_query,
+            topic=(topic or "").strip(),
+            author=(author or "").strip(),
+            from_year=from_year,
+            to_year=to_year,
+            categories=categories or [],
             start=0,
             max_results=min(self.prefetch_max_results, self.hard_total_cap),
         )
@@ -363,8 +407,13 @@ class ChatService:
             if chunk <= 0:
                 return
 
+            s = state.meta.get("search") or {}
             fetched, total = await self._fetch_from_backend(
-                topic=state.current_query,
+                topic=(s.get("topic") or ""),
+                author=(s.get("author") or ""),
+                from_year=s.get("from_year"),
+                to_year=s.get("to_year"),
+                categories=s.get("categories") or [],
                 start=start,
                 max_results=chunk,
             )
@@ -402,10 +451,28 @@ class ChatService:
             return {"title": str(p)}
 
     async def _fetch_from_backend(
-        self, topic: str, start: int, max_results: int
+        self,
+        topic: str,
+        author: str = "",
+        from_year: Optional[int] = None,
+        to_year: Optional[int] = None,
+        categories: Optional[List[str]] = None,
+        start: int = 0,
+        max_results: int = 10,
     ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-        print(f"[CHATBOT] backend.search(topic={topic!r}, start={start}, max_results={max_results})")
-        resp = await self.arxiv.search(topic=topic, start=start, max_results=max_results)
+        print(
+            f"[CHATBOT] backend.search(topic={topic!r}, author={author!r}, from_year={from_year!r}, to_year={to_year!r}, "
+            f"categories={categories!r}, start={start}, max_results={max_results})"
+        )
+        resp = await self.arxiv.search(
+            topic=topic,
+            author=(author or "").strip() or None,
+            from_year=from_year,
+            to_year=to_year,
+            categories=categories or None,
+            start=start,
+            max_results=max_results,
+        )
 
         if resp is None:
             return [], None
@@ -534,12 +601,51 @@ class ChatService:
             "Actions allowed:\n"
             "- `help`\n"
             "- `reset`\n"
-            "- `search <topic>`\n"
+            "- `search <topic>` (or just type a topic)\n"
+            "- `search ... by <author>`\n"
+            "- `search ... between <YYYY> and <YYYY>`\n"
+            "- `search ... in <category>` (e.g., cs.AI, cs.LG, stat.ML)\n"
             "- `next`\n"
             "- `open <n>` (opens the nth paper on current page; if not on page, tries nth overall)\n"
             "- `open <title>` (opens the best matching paper title from current search)\n"
-            "- `paper <arxiv_id>`\n"
+            "- `paper <arxiv_id>` (open by exact arXiv id)\n\n"
+            "Examples:\n"
+            "- ai in healthcare\n"
+            "- papers by Andrew Ng\n"
+            "- ai in healthcare between 2020 and 2022\n"
+            "- cs.AI papers between 2020 and 2022\n"
         )
+
+    
+    def _describe_search(
+        self,
+        topic: str,
+        author: str,
+        from_year: Optional[int],
+        to_year: Optional[int],
+        categories: List[str],
+    ) -> str:
+        """
+        Human-friendly description of the current structured search.
+
+        Stored into SessionState.current_query so UX stays consistent with older
+        "topic-only" searches (used in headers like: Showing X results for ...).
+        """
+        parts: List[str] = []
+        if topic:
+            parts.append(topic)
+        if author:
+            parts.append(f'by {author}')
+        if from_year is not None and to_year is not None:
+            parts.append(f'between {from_year} and {to_year}')
+        elif from_year is not None:
+            parts.append(f'from {from_year}')
+        elif to_year is not None:
+            parts.append(f'until {to_year}')
+        if categories:
+            parts.append("in " + ", ".join(categories))
+        # Fallback (shouldn't happen because we validate at least one constraint)
+        return " ".join(parts).strip() or "(search)"
 
     def _meta(self, state) -> Dict[str, Any]:
         return {

@@ -46,10 +46,14 @@ def health():
 
 
 def _search_cache_key(req: SearchRequest, max_results: int) -> str:
-    norm_topic = QueryNormalizer.normalize_topic(req.topic)
+    norm_topic = QueryNormalizer.normalize_topic((req.topic or ""))
+    norm_author = QueryNormalizer.normalize_author(req.author)
     norm_cats = QueryNormalizer.normalize_categories(req.categories)
+    norm_years = QueryNormalizer.normalize_year_range(req.from_year, req.to_year)
     return (
         f"q={norm_topic}"
+        f"|author={norm_author}"
+        f"|years={norm_years}"
         f"|start={req.start}"
         f"|max={max_results}"
         f"|sort={req.sort_by}:{req.sort_order}"
@@ -119,6 +123,10 @@ def _raise_upstream_http_exception(err: Exception) -> None:
 )
 async def search(req: SearchRequest, response: Response):
     max_results = min(req.max_results, settings.max_max_results)
+    # Basic validation: at least one constraint must be provided
+    if not (req.topic and req.topic.strip()) and not (req.author and req.author.strip()) and not req.categories and req.from_year is None and req.to_year is None:
+        raise HTTPException(status_code=400, detail="Provide at least one of: topic, author, categories, from_year/to_year.")
+
     cache_key = _search_cache_key(req, max_results)
 
     logger.info("SEARCH request received. cache_key=%s", cache_key)
@@ -138,7 +146,10 @@ async def search(req: SearchRequest, response: Response):
 
     async def work():
         result = await service.search(
-            topic=req.topic,
+            topic=(req.topic or ""),
+            author=req.author,
+            from_year=req.from_year,
+            to_year=req.to_year,
             start=req.start,
             max_results=max_results,
             sort_by=req.sort_by,
@@ -147,7 +158,7 @@ async def search(req: SearchRequest, response: Response):
         )
 
         resp = SearchResponse(
-            query=req.topic,
+            query=result.get("query") or (req.topic or ""),
             start=req.start,
             max_results=max_results,
             total_results=result["total"],

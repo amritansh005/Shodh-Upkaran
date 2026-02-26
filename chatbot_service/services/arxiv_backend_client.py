@@ -22,6 +22,9 @@ class ArxivBackendClient:
     async def search(
         self,
         topic: str,
+        author: Optional[str] = None,
+        from_year: Optional[int] = None,
+        to_year: Optional[int] = None,
         start: int = 0,
         max_results: int = 10,
         sort_by: str = "relevance",
@@ -31,6 +34,9 @@ class ArxivBackendClient:
 
         payload = {
             "topic": topic,
+            "author": author,
+            "from_year": from_year,
+            "to_year": to_year,
             "start": start,
             "max_results": max_results,
             "sort_by": sort_by,

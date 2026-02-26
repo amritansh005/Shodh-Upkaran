@@ -47,17 +47,58 @@ class ArxivClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    def build_search_query(self, topic: str, categories: Optional[List[str]] = None) -> str:
-        safe_topic = topic.strip().replace('"', "")
-        base = f'(ti:"{safe_topic}" OR abs:"{safe_topic}")'
+    def build_search_query(
+        self,
+        topic: str = "",
+        author: Optional[str] = None,
+        from_year: Optional[int] = None,
+        to_year: Optional[int] = None,
+        categories: Optional[List[str]] = None,
+    ) -> str:
+        """Build an arXiv API `search_query` string.
+
+        We keep your original behavior (title+abstract) but add optional:
+          - author (au:"...")
+          - category filters (cat:...)
+          - submittedDate range (YYYYMMDDhhmm)
+
+        All provided constraints are AND'ed together.
+        """
+        parts: List[str] = []
+
+        safe_topic = (topic or "").strip().replace('"', "").replace("'", "")
+        if safe_topic:
+            parts.append(f'(ti:"{safe_topic}" OR abs:"{safe_topic}")')
+
+        safe_author = (author or "").strip().replace('"', "").replace("'", "")
+        if safe_author:
+            parts.append(f'au:"{safe_author}"')
+
+        # submittedDate range is inclusive; we map years to full-year windows.
+        if from_year is not None or to_year is not None:
+            fy = int(from_year) if from_year is not None else 1900
+            ty = int(to_year) if to_year is not None else 2100
+            if ty < fy:
+                fy, ty = ty, fy
+            start = f"{fy:04d}01010000"
+            end = f"{ty:04d}12312359"
+            parts.append(f"submittedDate:[{start} TO {end}]")
 
         if categories:
-            cat_parts = [f"cat:{c.strip()}" for c in categories if c.strip()]
+            cat_parts = [f"cat:{c.strip()}" for c in categories if (c or '').strip()]
             if cat_parts:
                 cat_q = " OR ".join(cat_parts)
-                return f"({base}) AND ({cat_q})"
+                parts.append(f"({cat_q})")
 
-        return base
+        # If nothing is provided, return empty (caller should validate)
+        if not parts:
+            return ""
+
+        if len(parts) == 1:
+            return parts[0]
+
+        return " AND ".join(f"({p})" for p in parts)
+
 
     async def _get_throttled(self, url: str, params: Dict[str, Any]) -> httpx.Response:
         """
@@ -113,13 +154,26 @@ class ArxivClient:
     async def search(
         self,
         topic: str,
+        author: Optional[str],
+        from_year: Optional[int],
+        to_year: Optional[int],
         start: int,
         max_results: int,
         sort_by: str,
         sort_order: str,
         categories: Optional[List[str]] = None,
-    ) -> Tuple[Optional[int], List[Dict[str, Any]]]:
-        search_query = self.build_search_query(topic=topic, categories=categories)
+    ) -> Tuple[Optional[int], List[Dict[str, Any]], str]:
+        search_query = self.build_search_query(
+            topic=topic,
+            author=author,
+            from_year=from_year,
+            to_year=to_year,
+            categories=categories,
+        )
+
+        if not search_query:
+            # Caller should validate, but keep a defensive fallback.
+            return 0, [], ""
 
         params = {
             "search_query": search_query,
@@ -146,7 +200,7 @@ class ArxivClient:
         except Exception:
             total = None
 
-        return total, list(feed.entries)
+        return total, list(feed.entries), search_query
 
     async def get_by_id(self, arxiv_id: str) -> Optional[Dict[str, Any]]:
         clean_id = arxiv_id.strip().replace("arxiv:", "")

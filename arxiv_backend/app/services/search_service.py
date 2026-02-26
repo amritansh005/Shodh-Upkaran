@@ -92,14 +92,20 @@ class SearchService:
     async def search(
         self,
         topic: str,
+        author: Optional[str],
+        from_year: Optional[int],
+        to_year: Optional[int],
         start: int,
         max_results: int,
         sort_by: str,
         sort_order: str,
         categories: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        total, entries = await self.client.search(
+        total, entries, built_query = await self.client.search(
             topic=topic,
+            author=author,
+            from_year=from_year,
+            to_year=to_year,
             start=start,
             max_results=max_results,
             sort_by=sort_by,
@@ -107,7 +113,7 @@ class SearchService:
             categories=categories,
         )
         papers = [normalize_entry(e) for e in entries]
-        return {"total": total, "papers": papers}
+        return {"total": total, "papers": papers, "query": built_query}
 
     async def get_paper(self, arxiv_id: str) -> Optional[Paper]:
         entry = await self.client.get_by_id(arxiv_id)
