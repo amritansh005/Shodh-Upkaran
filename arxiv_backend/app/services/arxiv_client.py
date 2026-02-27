@@ -32,10 +32,10 @@ class ArxivClient:
                 read=settings.http_timeout_seconds,
                 write=10.0,
                 pool=10.0,
-                ),
-                headers={"User-Agent": settings.user_agent},
-                follow_redirects=True,
-                )
+            ),
+            headers={"User-Agent": settings.user_agent},
+            follow_redirects=True,
+        )
 
         # Global throttles for outgoing traffic
         self._concurrency = AsyncConcurrencyLimiter(settings.outgoing_max_concurrency)
@@ -85,7 +85,7 @@ class ArxivClient:
             parts.append(f"submittedDate:[{start} TO {end}]")
 
         if categories:
-            cat_parts = [f"cat:{c.strip()}" for c in categories if (c or '').strip()]
+            cat_parts = [f"cat:{c.strip()}" for c in categories if (c or "").strip()]
             if cat_parts:
                 cat_q = " OR ".join(cat_parts)
                 parts.append(f"({cat_q})")
@@ -99,26 +99,44 @@ class ArxivClient:
 
         return " AND ".join(f"({p})" for p in parts)
 
-
     async def _get_throttled(self, url: str, params: Dict[str, Any]) -> httpx.Response:
         """
         Applies:
           1) concurrency limit
           2) rate limit
           3) retries on 429 + transient 5xx/timeouts
+          4) overall deadline across retry chain (attempts + sleeps)
         """
         max_retries = settings.outgoing_max_retries
         base = settings.outgoing_retry_backoff_base_seconds
 
+        # NEW: overall budget for the whole retry chain
+        deadline_s = float(getattr(settings, "outgoing_total_deadline_seconds", 0) or 0)
+        loop = asyncio.get_running_loop()
+        start_t = loop.time()
+
+        def remaining_budget() -> float:
+            if deadline_s <= 0:
+                return 1e9  # effectively no deadline
+            return deadline_s - (loop.time() - start_t)
+
         attempt = 0
         while True:
             attempt += 1
+
+            rem = remaining_budget()
+            if rem <= 0:
+                raise httpx.ReadTimeout(f"overall upstream deadline exceeded ({deadline_s:.1f}s)")
+
             try:
                 logger.info("THROTTLE: waiting for slot + token")
                 async with self._concurrency:
                     await self._rate.acquire()
                     logger.info("THROTTLE: acquired slot + token → sending upstream request")
-                    resp = await self._client.get(url, params=params)
+
+                    # Bound this request by remaining budget (and also your standard timeout)
+                    req_timeout = min(rem, float(settings.http_timeout_seconds))
+                    resp = await self._client.get(url, params=params, timeout=req_timeout)
 
                 # If upstream rate-limits you, honor Retry-After if present
                 if resp.status_code == 429:
@@ -128,7 +146,19 @@ class ArxivClient:
                             sleep_s = float(retry_after)
                         else:
                             sleep_s = base * (2 ** (attempt - 1))
-                        logger.warning("UPSTREAM 429. retrying in %.2fs attempt=%d/%d", sleep_s, attempt, max_retries)
+
+                        # Don't sleep past overall budget
+                        rem = remaining_budget()
+                        if rem <= 0:
+                            raise httpx.ReadTimeout(f"overall upstream deadline exceeded ({deadline_s:.1f}s)")
+                        sleep_s = min(sleep_s, max(0.0, rem))
+
+                        logger.warning(
+                            "UPSTREAM 429. retrying in %.2fs attempt=%d/%d",
+                            sleep_s,
+                            attempt,
+                            max_retries,
+                        )
                         await asyncio.sleep(sleep_s)
                         continue
 
@@ -136,7 +166,19 @@ class ArxivClient:
                 if resp.status_code in (502, 503, 504):
                     if attempt <= max_retries:
                         sleep_s = base * (2 ** (attempt - 1))
-                        logger.warning("UPSTREAM %d. retrying in %.2fs attempt=%d/%d", resp.status_code, sleep_s, attempt, max_retries)
+
+                        rem = remaining_budget()
+                        if rem <= 0:
+                            raise httpx.ReadTimeout(f"overall upstream deadline exceeded ({deadline_s:.1f}s)")
+                        sleep_s = min(sleep_s, max(0.0, rem))
+
+                        logger.warning(
+                            "UPSTREAM %d. retrying in %.2fs attempt=%d/%d",
+                            resp.status_code,
+                            sleep_s,
+                            attempt,
+                            max_retries,
+                        )
                         await asyncio.sleep(sleep_s)
                         continue
 
@@ -146,7 +188,19 @@ class ArxivClient:
             except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as e:
                 if attempt <= max_retries:
                     sleep_s = base * (2 ** (attempt - 1))
-                    logger.warning("UPSTREAM network error (%s). retrying in %.2fs attempt=%d/%d", str(e), sleep_s, attempt, max_retries)
+
+                    rem = remaining_budget()
+                    if rem <= 0:
+                        raise httpx.ReadTimeout(f"overall upstream deadline exceeded ({deadline_s:.1f}s)") from e
+                    sleep_s = min(sleep_s, max(0.0, rem))
+
+                    logger.warning(
+                        "UPSTREAM network error (%s). retrying in %.2fs attempt=%d/%d",
+                        str(e),
+                        sleep_s,
+                        attempt,
+                        max_retries,
+                    )
                     await asyncio.sleep(sleep_s)
                     continue
                 raise

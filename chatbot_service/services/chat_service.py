@@ -4,6 +4,8 @@ import difflib
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+import asyncio
+
 
 class ChatService:
     """
@@ -850,15 +852,22 @@ class ChatService:
             f"[CHATBOT] backend.search(topic={topic!r}, author={author!r}, from_year={from_year!r}, to_year={to_year!r}, "
             f"categories={categories!r}, start={start}, max_results={max_results})"
         )
-        resp = await self.arxiv.search(
-            topic=topic,
-            author=(author or "").strip() or None,
-            from_year=from_year,
-            to_year=to_year,
-            categories=categories or None,
-            start=start,
-            max_results=max_results,
-        )
+
+        try:
+            resp = await asyncio.wait_for(
+                self.arxiv.search(
+                    topic=topic,
+                    author=(author or "").strip() or None,
+                    from_year=from_year,
+                    to_year=to_year,
+                    categories=categories or None,
+                    start=start,
+                    max_results=max_results,
+                ),
+                timeout=90.0,
+            )
+        except asyncio.TimeoutError:
+            return [], None
 
         if resp is None:
             return [], None
@@ -914,17 +923,43 @@ class ChatService:
 
         return val[:10].strip()
 
-    def _format_authors(self, p: Dict[str, Any], max_authors: int = 6) -> str:
+    def _format_authors(self, p: Dict[str, Any], max_authors: int = 6, prioritize_author: str = "") -> str:
         authors = p.get("authors") or p.get("author") or p.get("creators") or []
         if isinstance(authors, list):
             clean = [str(a).strip() for a in authors if str(a).strip()]
             if not clean:
                 return ""
-            if len(clean) <= max_authors:
-                return ", ".join(clean)
-            return ", ".join(clean[:max_authors]) + ", et al."
+
+            # If this was an author-filtered search, prioritize showing that author
+            # in the limited "first N authors + et al." preview.
+            pa = (prioritize_author or "").strip().lower()
+            if pa:
+                best_i: Optional[int] = None
+                best_score = 0  # 2=exact match, 1=substring match
+
+                for i, name in enumerate(clean):
+                    n = name.lower()
+                    if n == pa:
+                        best_i = i
+                        best_score = 2
+                        break
+                    if pa in n and best_score < 1:
+                        best_i = i
+                        best_score = 1
+
+                # Move matched author to front for display only
+                if best_i is not None and best_i != 0:
+                    matched = clean[best_i]
+                    rest = [x for j, x in enumerate(clean) if j != best_i]
+                    clean = [matched] + rest
+
+            shown = clean[:max_authors]
+            suffix = ", et al." if len(clean) > max_authors else ""
+            return ", ".join(shown) + suffix
+
         if authors:
             return str(authors).strip()
+
         return ""
 
     def _format_list_reply(self, state, start: int, page: List[Dict[str, Any]], note: str = "") -> str:
@@ -945,7 +980,8 @@ class ChatService:
 
         for i, p in enumerate(page, start=1):
             title = (p.get("title") or "").strip() or "Untitled"
-            authors_str = self._format_authors(p, max_authors=6)
+            searched_author = str((state.meta.get("search") or {}).get("author") or "").strip()
+            authors_str = self._format_authors(p, max_authors=6, prioritize_author=searched_author)
             published = self._format_published_date(p)
 
             meta_bits: List[str] = []

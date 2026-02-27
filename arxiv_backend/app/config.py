@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # Set to 0 in normal / production usage.
     # Can be overridden via env: ARXIV_COALESCE_TEST_DELAY_SECONDS
     # -------------------------------------------------
-    coalesce_test_delay_seconds: int = 2
+    coalesce_test_delay_seconds: int = 0
 
     # -------------------------------------------------
     # GLOBAL outgoing throttle (client-side)
@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     #   ARXIV_OUTGOING_BURST
     #   ARXIV_OUTGOING_MAX_RETRIES
     #   ARXIV_OUTGOING_RETRY_BACKOFF_BASE_SECONDS
+    #   ARXIV_OUTGOING_TOTAL_DEADLINE_SECONDS
     # -------------------------------------------------
     outgoing_max_concurrency: int = 5   # max parallel upstream calls
     outgoing_rps: float = 2.0           # sustained requests/sec
@@ -56,6 +57,14 @@ class Settings(BaseSettings):
     # Retries for upstream throttles/transient failures
     outgoing_max_retries: int = 3
     outgoing_retry_backoff_base_seconds: float = 0.5  # exponential backoff base
+
+    # -------------------------------------------------
+    # NEW: Overall deadline for the FULL retry sequence
+    # (includes request time + backoff sleeps across attempts)
+    # Prevents a single request from blocking for minutes.
+    # Can be overridden via env: ARXIV_OUTGOING_TOTAL_DEADLINE_SECONDS
+    # -------------------------------------------------
+    outgoing_total_deadline_seconds: float = 90.0
 
 
 settings = Settings()

@@ -11,7 +11,19 @@ while True:
     if msg.lower() in {"exit", "quit"}:
         break
 
-    r = requests.post(CHATBOT_URL, json={"session_id": session_id, "message": msg}, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    print("\nBot:", data["reply"], "\n")
+    try:
+        # Increased timeout to survive slow upstream arXiv retry windows
+        r = requests.post(
+            CHATBOT_URL,
+            json={"session_id": session_id, "message": msg},
+            timeout=300,
+        )
+        r.raise_for_status()
+        data = r.json()
+        print("\nBot:", data["reply"], "\n")
+
+    except requests.exceptions.ReadTimeout:
+        print("\nBot: arXiv/backend is taking too long right now (timeout). Try again in a bit.\n")
+
+    except requests.exceptions.RequestException as e:
+        print(f"\nBot: request failed: {e}\n")
