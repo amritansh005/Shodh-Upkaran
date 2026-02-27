@@ -58,6 +58,26 @@ class ChatService:
         return bool(self._CANCEL_RE.match((msg or "").strip()))
 
     # -----------------------------
+    # NEW: PDF-vs-summary disambiguation helpers
+    # -----------------------------
+    _PDF_CUES = (
+        "pdf",
+        "download",
+        "download link",
+        "pdf link",
+        "link",
+        "url",
+        "view pdf",
+        "open pdf",
+    )
+
+    def _wants_pdf(self, msg: str) -> bool:
+        m = (msg or "").strip().lower()
+        if not m:
+            return False
+        return any(c in m for c in self._PDF_CUES)
+
+    # -----------------------------
     # Public entrypoint (LLM-only routing)
     # -----------------------------
 
@@ -85,7 +105,9 @@ class ChatService:
                 to_year = pending.get("to_year", None)
                 categories = pending.get("categories") or []
 
-                print(f"[CHATBOT] pending_search confirmed -> topic={topic!r}, author={author!r}, years={from_year}-{to_year}, cats={categories!r}")
+                print(
+                    f"[CHATBOT] pending_search confirmed -> topic={topic!r}, author={author!r}, years={from_year}-{to_year}, cats={categories!r}"
+                )
 
                 return await self._do_search(
                     state,
@@ -132,24 +154,28 @@ class ChatService:
 
         # -----------------------------
         # Session-first resolution (confidence thresholds)
-        # If a list is on screen (active results context), interpret OPEN/READ requests
-        # as selecting from that list first. Only run a new SEARCH if the current list
-        # has zero reasonable candidates for what the user asked.
+        # If a list is on screen (active results context), interpret OPEN/SUMMARY requests
+        # as selecting from that list first.
         # -----------------------------
         has_arc = bool(state.current_query) and bool(state.last_results or state.prefetched_results)
         looks_like_open = self._looks_like_open_request(msg)
 
         if has_arc and action == "search" and looks_like_open:
-            # LLM may misclassify "open the paper by X" as a SEARCH (author search).
-            # Prefer opening from the current list first.
-            return await self._do_open_from_context(state, intent, user_message=msg)
+            # LLM may misclassify "open/summarize the paper by X" as SEARCH.
+            # Prefer resolving from the current list first.
+            mode = "pdf" if self._wants_pdf(msg) else "summary"
+            return await self._do_open_from_context(state, intent, user_message=msg, mode=mode)
 
-        if has_arc and action == "open":
-            # If OPEN action lacks index/title/arxiv_id but includes selectors, resolve against current list.
+        if has_arc and action in ("open", "summary"):
+            # If action lacks index/title/arxiv_id but includes selectors, resolve against current list.
             if index is None and not title and not arxiv_id and (
                 author or topic or (from_year is not None) or (to_year is not None) or categories
             ):
-                return await self._do_open_from_context(state, intent, user_message=msg)
+                mode = "pdf" if action == "open" else "summary"
+                # If user explicitly asks for pdf while action is summary, honor user text.
+                if self._wants_pdf(msg):
+                    mode = "pdf"
+                return await self._do_open_from_context(state, intent, user_message=msg, mode=mode)
 
         if action == "help":
             return self._help_text(), [], self._meta(state)
@@ -180,7 +206,7 @@ class ChatService:
             )
 
         # The remaining actions require an active search context
-        if action in ("next", "open", "paper") and not state.current_query:
+        if action in ("next", "open", "summary", "paper") and not state.current_query:
             return (
                 "No active search yet. Use: `search <topic>` (example: `search transformers in nlp`).",
                 [],
@@ -190,7 +216,12 @@ class ChatService:
         if action == "next":
             return await self._do_next(state)
 
-        if action == "open":
+        if action in ("open", "summary"):
+            mode = "pdf" if action == "open" else "summary"
+            # If message text contains pdf/download cues, force pdf mode.
+            if self._wants_pdf(msg):
+                mode = "pdf"
+
             # Prefer explicit index when provided
             if index is not None:
                 try:
@@ -198,23 +229,24 @@ class ChatService:
                 except Exception:
                     idx_int = None
                 if idx_int is None:
-                    return "Usage: `open 5` or `open <title>`", [], self._meta(state)
-                return await self._do_open_index(state, idx_int)
+                    return "Usage: `open 5` or `summary 5` or `open <title>`", [], self._meta(state)
+                return await self._do_open_index(state, idx_int, mode=mode)
 
             # Otherwise try open-by-title
             if title:
-                return await self._do_open_title(state, title)
+                return await self._do_open_title(state, title, mode=mode)
 
             # If no title/index but user wrote an open-like message, try context resolution
             if has_arc and looks_like_open:
-                return await self._do_open_from_context(state, intent, user_message=msg)
+                return await self._do_open_from_context(state, intent, user_message=msg, mode=mode)
 
-            return "Usage: `open 5` or `open <title>`", [], self._meta(state)
+            return "Usage: `open 5` / `summary 5` or `open <title>`", [], self._meta(state)
 
         if action == "paper":
             if not arxiv_id:
                 return "Usage: `paper <arxiv_id>` (example: `paper 2003.10303`)", [], self._meta(state)
-            return await self._do_paper(state, arxiv_id)
+            mode = "pdf" if self._wants_pdf(msg) else "summary"
+            return await self._do_paper(state, arxiv_id, mode=mode)
 
         # chat / small-talk
         if action == "chat":
@@ -309,12 +341,16 @@ class ChatService:
         return reply, page, self._meta(state)
 
     async def _do_open_index(
-        self, state, idx: int
+        self, state, idx: int, mode: str = "pdf"
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         """
         Behavior:
         - If idx fits within current page (state.last_results): open that.
         - Else treat idx as global index across entire search and load as needed.
+
+        mode:
+        - "summary" -> show abstract/summary
+        - "pdf"     -> show PDF link
         """
         if idx is None or idx <= 0:
             return "Index must be >= 1. Example: `open 2`", [], self._meta(state)
@@ -323,7 +359,7 @@ class ChatService:
         if state.last_results and 1 <= idx <= len(state.last_results):
             print(f"[CHATBOT] open served from CURRENT PAGE cache (idx={idx}, cursor_start={state.cursor_start})")
             paper = state.last_results[idx - 1]
-            return self._format_paper_reply(paper), [paper], self._meta(state)
+            return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
 
         # Otherwise interpret as "open Nth overall in this search"
         global_index = idx - 1
@@ -334,10 +370,10 @@ class ChatService:
             return "That index is beyond the results I have.", [], self._meta(state)
 
         paper = state.prefetched_results[global_index]
-        return self._format_paper_reply(paper), [paper], self._meta(state)
+        return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
 
     async def _do_open_title(
-        self, state, raw_title: str
+        self, state, raw_title: str, mode: str = "pdf"
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         """Open a paper by (approximate) title.
 
@@ -357,7 +393,7 @@ class ChatService:
         for _ in range(max_rounds):
             paper, candidates = self._find_best_title_match(state, query)
             if paper is not None:
-                return self._format_paper_reply(paper), [paper], self._meta(state)
+                return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
 
             if candidates:
                 lines = [
@@ -576,12 +612,17 @@ class ChatService:
         state,
         intent: Dict[str, Any],
         user_message: str,
+        mode: str = "pdf",
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         """Resolve an OPEN-like request using the current list first (confidence thresholds).
 
         - Try within current page (state.last_results) first.
         - Then try within all loaded results (state.prefetched_results).
         - Only if zero reasonable candidates exist, ask whether it is a new search.
+
+        mode:
+        - "summary" -> show abstract/summary
+        - "pdf"     -> show PDF link
         """
         author = str(intent.get("author") or "").strip()
         topic = str(intent.get("topic") or "").strip()
@@ -594,11 +635,11 @@ class ChatService:
         # If user provided an index or arXiv id, defer to explicit handlers.
         if index is not None:
             try:
-                return await self._do_open_index(state, int(index))
+                return await self._do_open_index(state, int(index), mode=mode)
             except Exception:
                 pass
         if arxiv_id:
-            return await self._do_paper(state, arxiv_id)
+            return await self._do_paper(state, arxiv_id, mode=mode)
 
         page_view = state.last_results or []
         loaded = state.prefetched_results or []
@@ -607,7 +648,7 @@ class ChatService:
         if title:
             paper, cands = self._title_best_in(page_view, title)
             if paper is not None:
-                return self._format_paper_reply(paper), [paper], self._meta(state)
+                return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
 
             if cands:
                 if self._wants_show_all(user_message):
@@ -621,7 +662,7 @@ class ChatService:
 
                 if self._wants_choose_one(user_message):
                     chosen = cands[0]
-                    return self._format_paper_reply(chosen), [chosen], self._meta(state)
+                    return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
 
                 txt = self._format_candidate_choices(
                     state,
@@ -633,7 +674,7 @@ class ChatService:
 
             paper2, cands2 = self._title_best_in(loaded, title)
             if paper2 is not None:
-                return self._format_paper_reply(paper2), [paper2], self._meta(state)
+                return self._format_paper_by_mode(paper2, mode=mode), [paper2], self._meta(state)
 
             if cands2:
                 if self._wants_show_all(user_message):
@@ -647,7 +688,7 @@ class ChatService:
 
                 if self._wants_choose_one(user_message):
                     chosen = cands2[0]
-                    return self._format_paper_reply(chosen), [chosen], self._meta(state)
+                    return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
 
                 txt = self._format_candidate_choices(
                     state,
@@ -674,7 +715,7 @@ class ChatService:
 
         if len(page_matches) == 1:
             p = page_matches[0]
-            return self._format_paper_reply(p), [p], self._meta(state)
+            return self._format_paper_by_mode(p, mode=mode), [p], self._meta(state)
 
         if len(page_matches) > 1:
             if self._wants_show_all(user_message):
@@ -688,7 +729,7 @@ class ChatService:
 
             if self._wants_choose_one(user_message):
                 chosen = page_matches[0]
-                return self._format_paper_reply(chosen), [chosen], self._meta(state)
+                return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
 
             txt = self._format_candidate_choices(
                 state,
@@ -709,7 +750,7 @@ class ChatService:
 
         if len(loaded_matches) == 1:
             p = loaded_matches[0]
-            return self._format_paper_reply(p), [p], self._meta(state)
+            return self._format_paper_by_mode(p, mode=mode), [p], self._meta(state)
 
         if len(loaded_matches) > 1:
             if self._wants_show_all(user_message):
@@ -723,7 +764,7 @@ class ChatService:
 
             if self._wants_choose_one(user_message):
                 chosen = loaded_matches[0]
-                return self._format_paper_reply(chosen), [chosen], self._meta(state)
+                return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
 
             txt = self._format_candidate_choices(
                 state,
@@ -829,7 +870,7 @@ class ChatService:
         return None, []
 
     async def _do_paper(
-        self, state, arg: str
+        self, state, arg: str, mode: str = "summary"
     ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
         arxiv_id = (arg or "").strip()
         if not arxiv_id:
@@ -841,13 +882,13 @@ class ChatService:
                 return f"No paper found for arXiv id: {arxiv_id}", [], self._meta(state)
 
             paper_dict = self._paper_to_dict(paper)
-            return self._format_paper_reply(paper_dict), [paper_dict], self._meta(state)
+            return self._format_paper_by_mode(paper_dict, mode=mode), [paper_dict], self._meta(state)
 
         except Exception:
             for p in state.prefetched_results:
                 pid = str(p.get("arxiv_id") or p.get("id") or "")
                 if pid == arxiv_id:
-                    return self._format_paper_reply(p), [p], self._meta(state)
+                    return self._format_paper_by_mode(p, mode=mode), [p], self._meta(state)
             return f"No paper found for arXiv id: {arxiv_id}", [], self._meta(state)
 
     # -----------------------------
@@ -1077,7 +1118,10 @@ class ChatService:
 
         return "\n".join(lines)
 
-    def _format_paper_reply(self, p: Dict[str, Any]) -> str:
+    # --------
+    # NEW: two output styles for a selected paper
+    # --------
+    def _format_paper_summary_reply(self, p: Dict[str, Any]) -> str:
         title = (p.get("title") or "").strip() or "Untitled"
 
         authors_str = self._format_authors(p, max_authors=8)
@@ -1098,6 +1142,60 @@ class ChatService:
 
         return "\n".join(lines)
 
+    def _get_pdf_url(self, p: Dict[str, Any]) -> str:
+        # Prefer explicit pdf_url from backend
+        pdf = (
+            p.get("pdf_url")
+            or p.get("pdf")
+            or p.get("pdfLink")
+            or p.get("pdf_link")
+            or ""
+        )
+        if isinstance(pdf, dict):
+            pdf = pdf.get("href") or pdf.get("url") or ""
+
+        pdf = str(pdf or "").strip()
+        if pdf:
+            return pdf
+
+        # Fallback: construct from arXiv id if available
+        arxiv_id = str(p.get("arxiv_id") or p.get("id") or "").strip()
+        if arxiv_id:
+            return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+        return ""
+
+    def _format_paper_pdf_reply(self, p: Dict[str, Any]) -> str:
+        title = (p.get("title") or "").strip() or "Untitled"
+
+        authors_str = self._format_authors(p, max_authors=8)
+        published = self._format_published_date(p)
+        pdf_url = self._get_pdf_url(p)
+
+        lines: List[str] = [f"**{title}**"]
+        if authors_str:
+            lines.append(f"Authors: {authors_str}")
+        if published:
+            lines.append(f"Published: {published}")
+
+        lines.append("")
+        if pdf_url:
+            lines.append(f"PDF: {pdf_url}")
+        else:
+            lines.append("PDF: (not available in this record)")
+
+        return "\n".join(lines)
+
+    def _format_paper_by_mode(self, p: Dict[str, Any], mode: str = "summary") -> str:
+        m = (mode or "summary").strip().lower()
+        if m in ("pdf", "open", "download"):
+            return self._format_paper_pdf_reply(p)
+        return self._format_paper_summary_reply(p)
+
+    # Backward compatibility: keep old name, but route to summary
+    def _format_paper_reply(self, p: Dict[str, Any]) -> str:
+        return self._format_paper_summary_reply(p)
+
     def _help_text(self) -> str:
         return (
             "Actions allowed:\n"
@@ -1108,14 +1206,18 @@ class ChatService:
             "- `search ... between <YYYY> and <YYYY>`\n"
             "- `search ... in <category>` (e.g., cs.AI, cs.LG, stat.ML)\n"
             "- `next`\n"
-            "- `open <n>` (opens the nth paper on current page; if not on page, tries nth overall)\n"
-            "- `open <title>` (opens the best matching paper title from current search)\n"
-            "- `paper <arxiv_id>` (open by exact arXiv id)\n\n"
+            "- `summary <n>` (shows abstract/details for nth paper on current page)\n"
+            "- `open <n>` (shows PDF link for nth paper on current page; if not on page, tries nth overall)\n"
+            "- `open <title>` (shows PDF link for best matching paper title from current search)\n"
+            "- `paper <arxiv_id>` (shows details)\n"
+            "- `paper <arxiv_id> pdf` (shows PDF link)\n\n"
             "Examples:\n"
             "- ai in healthcare\n"
             "- papers by Andrew Ng\n"
             "- ai in healthcare between 2020 and 2022\n"
             "- cs.AI papers between 2020 and 2022\n"
+            "- summarize the 1st paper\n"
+            "- open the 1st paper pdf\n"
         )
 
     def _describe_search(

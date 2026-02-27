@@ -15,7 +15,7 @@ Return ONLY valid JSON. No markdown. No explanation. No extra text.
 Schema (ALWAYS include all fields):
 
 {
-  "action": "search" | "open" | "next" | "help" | "reset" | "paper" | "chat",
+  "action": "search" | "summary" | "open" | "next" | "help" | "reset" | "paper" | "chat",
   "topic": string,
   "author": string,
   "from_year": integer or null,
@@ -29,17 +29,18 @@ Schema (ALWAYS include all fields):
 
 Core actions:
 - search: user wants a NEW list of papers (topic/author/year/categories constraints)
-- open: user wants details of a SPECIFIC paper (by index/title/arxiv_id or "this/that paper")
+- summary: user wants details/abstract/summary/data-related info about ONE specific paper
+- open: user wants the PDF/download link for ONE specific paper
 - next: user wants more results of the CURRENT list
 - reset: ONLY when user explicitly says reset/clear/start over (never use reset for "yes" confirmations)
-- paper: open by explicit arXiv id
+- paper: user provided an explicit arXiv id (e.g. "paper 2003.10303")
 - help: commands/capabilities
 - chat: small talk / acknowledgements / ambiguous replies
 
 IMPORTANT DISAMBIGUATION RULES (to avoid wrong behavior):
 
-A) LIST REQUEST vs OPEN REQUEST (critical):
-- If the user is asking to LIST papers (e.g. "show me papers", "list papers", "all research papers", "find papers", "search papers")
+A) LIST REQUEST vs SINGLE-PAPER REQUEST (critical):
+- If user is asking to LIST papers (e.g. "show me papers", "list papers", "find papers", "search papers", "all research papers"),
   then action MUST be "search" (even if words like "show me" appear).
   Examples (=> search):
     - "Show me all research papers written by Andrew Ng"
@@ -47,21 +48,38 @@ A) LIST REQUEST vs OPEN REQUEST (critical):
     - "List cs.AI papers between 2020 and 2022"
     - "Find papers by Andrew Ng between 2020 and 2025"
 
-- If the user is asking to OPEN/READ one specific paper from the current list, then action MUST be "open".
-  Examples (=> open):
-    - "open 5"
-    - "show me the 2nd paper"
-    - "open the paper titled DataPerf: Benchmarks for Data-Centric AI Development"
-    - "tell me about the 7th one"
-    - "summarize this paper"
+- If user is asking about ONE specific paper from the current list (by index/title/this/that paper), then action MUST be
+  either "summary" or "open" depending on whether they want details vs PDF link.
 
-B) When a list is on screen (session has active search context):
-- If user uses open/read/details/summarize/tell me about AND refers to a specific item (index/title/this/that/the paper),
-  action="open".
-- If user uses "show me" but is clearly asking for a NEW list (contains "papers" + constraints like author/topic/years/categories),
+B) SUMMARY vs OPEN (PDF) for one paper:
+- summary = details/abstract/summary/explain/tell me about/data related to
+  Examples (=> summary):
+    - "show me details of the 1st paper"
+    - "tell me about Responsible AI in Healthcare"
+    - "summarize the 2nd one"
+    - "what is this paper about?"
+    - "give me the abstract of the 3rd paper"
+
+- open = PDF/download/link/url/view
+  Examples (=> open):
+    - "open the 1st paper pdf"
+    - "download the 2nd paper"
+    - "give me the pdf link for Responsible AI in Healthcare"
+    - "view the paper 2103.14954"
+    - "open 5 (pdf)"
+
+C) When a list is on screen (session has active search context):
+- If user refers to a specific item (index/title/this/that/the paper):
+  - If user mentions pdf/download/link/url/view => action="open"
+  - Otherwise => action="summary"
+- If user is clearly asking for a NEW list (contains plural "papers" + constraints like author/topic/years/categories),
   action="search".
 
-C) Confirmation messages:
+D) arXiv id rule:
+- If the user includes an explicit arXiv id (like 2003.10303 or 2103.14954), set action="paper" and fill arxiv_id.
+  (Chat service will decide whether to show summary or PDF link using the user's wording.)
+
+E) Confirmation messages:
 - If user says just "yes", "okay", "sure", "no", "forget it", "never mind" WITHOUT any search constraints,
   action="chat" and chat_response should be short (or empty string).
 - NEVER output action="reset" for "yes its a new search". Use "chat" unless the user explicitly requested reset.
@@ -72,7 +90,7 @@ Slot extraction for SEARCH:
 - from_year/to_year: if user says "between <YYYY> and <YYYY>" or "from <YYYY> to <YYYY>" or "<YYYY> only"
 - categories: arXiv category codes like "cs.AI", "cs.LG", "stat.ML", "q-bio.QM" (array of strings)
 
-SEARCH examples:
+SEARCH example:
 Input: "show me research papers uploaded between 2020 and 2022 on ai in healthcare"
 Output:
 {
@@ -88,13 +106,12 @@ Output:
   "chat_response": ""
 }
 
-- If user message is just a topic like "ai in healthcare", treat as action="search" with topic="ai in healthcare".
-- If user says only an author constraint like "papers by Andrew Ng", action="search", topic="" and author="Andrew Ng".
+SINGLE PAPER examples:
+Input: "show me details of the 1st paper"
+Output: action="summary", index=1
 
-Slot extraction for OPEN:
-- index: if user says "open 5" / "5th paper" / "show me the 2nd paper" (1-based)
-- title: if user says "open <TITLE>" / "paper titled <TITLE>"
-- arxiv_id: if user says "paper 2103.14954"
+Input: "download the 1st paper"
+Output: action="open", index=1
 
 Other commands:
 - next: "next", "more results", "next page", "show more results"
@@ -183,7 +200,8 @@ class LLMClient:
 
         # Normalize and enforce schema
         action = str(data.get("action") or "chat").strip().lower()
-        if action not in {"search", "open", "next", "help", "reset", "paper", "chat"}:
+        allowed = {"search", "summary", "open", "next", "help", "reset", "paper", "chat"}
+        if action not in allowed:
             action = "chat"
 
         topic = str(data.get("topic") or "").strip()
