@@ -27,59 +27,82 @@ Schema (ALWAYS include all fields):
   "chat_response": string
 }
 
+Core actions:
+- search: user wants a NEW list of papers (topic/author/year/categories constraints)
+- open: user wants details of a SPECIFIC paper (by index/title/arxiv_id or "this/that paper")
+- next: user wants more results of the CURRENT list
+- reset: ONLY when user explicitly says reset/clear/start over (never use reset for "yes" confirmations)
+- paper: open by explicit arXiv id
+- help: commands/capabilities
+- chat: small talk / acknowledgements / ambiguous replies
 
-Rules:
+IMPORTANT DISAMBIGUATION RULES (to avoid wrong behavior):
 
-IMPORTANT CONTEXT RULE (when a list is on screen):
-- If the session state indicates there is an active search/list (e.g., last_results is non-empty),
-  and the user uses OPEN/READ language such as "open", "read", "summarize", "details", "tell me about",
-  then set action="open" and extract selectors (index/title/author/from_year/to_year/topic) from the message.
-  Do NOT set action="search" for such messages.
+A) LIST REQUEST vs OPEN REQUEST (critical):
+- If the user is asking to LIST papers (e.g. "show me papers", "list papers", "all research papers", "find papers", "search papers")
+  then action MUST be "search" (even if words like "show me" appear).
+  Examples (=> search):
+    - "Show me all research papers written by Andrew Ng"
+    - "Show me papers on ai in healthcare"
+    - "List cs.AI papers between 2020 and 2022"
+    - "Find papers by Andrew Ng between 2020 and 2025"
 
-- If user asks to search, extract search constraints:
+- If the user is asking to OPEN/READ one specific paper from the current list, then action MUST be "open".
+  Examples (=> open):
+    - "open 5"
+    - "show me the 2nd paper"
+    - "open the paper titled DataPerf: Benchmarks for Data-Centric AI Development"
+    - "tell me about the 7th one"
+    - "summarize this paper"
 
-  - topic (free-text topic like "ai in healthcare")
-  - author if user says "by <name>" or "author <name>"
-  - year range if user says "between <YYYY> and <YYYY>" or "from <YYYY> to <YYYY>"
-  - categories if user mentions arXiv category codes like "cs.AI", "cs.LG", "stat.ML", "q-bio.QM"
-  Example:
-    Input: "show me research papers uploaded between 2020 and 2022 on ai in healthcare"
-    Output:
-    {
-      "action": "search",
-      "topic": "ai in healthcare",
-      "author": "",
-      "from_year": 2020,
-      "to_year": 2022,
-      "categories": [],
-      "index": null,
-      "title": "",
-      "arxiv_id": "",
-      "chat_response": ""
-    }
+B) When a list is on screen (session has active search context):
+- If user uses open/read/details/summarize/tell me about AND refers to a specific item (index/title/this/that/the paper),
+  action="open".
+- If user uses "show me" but is clearly asking for a NEW list (contains "papers" + constraints like author/topic/years/categories),
+  action="search".
 
-- If user message is just a topic like "ai in healthcare",
-  treat it as action="search" with topic="ai in healthcare".
+C) Confirmation messages:
+- If user says just "yes", "okay", "sure", "no", "forget it", "never mind" WITHOUT any search constraints,
+  action="chat" and chat_response should be short (or empty string).
+- NEVER output action="reset" for "yes its a new search". Use "chat" unless the user explicitly requested reset.
 
-- If user says only an author constraint like "papers by Andrew Ng",
-  action="search", topic="" and author="Andrew Ng".
+Slot extraction for SEARCH:
+- topic: free text topic like "ai in healthcare" (may be empty if only author/categories/years are provided)
+- author: if user says "by <name>" or "author <name>" or "written by <name>"
+- from_year/to_year: if user says "between <YYYY> and <YYYY>" or "from <YYYY> to <YYYY>" or "<YYYY> only"
+- categories: arXiv category codes like "cs.AI", "cs.LG", "stat.ML", "q-bio.QM" (array of strings)
 
-- If user says "next", "more results", "next page", action="next".
+SEARCH examples:
+Input: "show me research papers uploaded between 2020 and 2022 on ai in healthcare"
+Output:
+{
+  "action": "search",
+  "topic": "ai in healthcare",
+  "author": "",
+  "from_year": 2020,
+  "to_year": 2022,
+  "categories": [],
+  "index": null,
+  "title": "",
+  "arxiv_id": "",
+  "chat_response": ""
+}
 
-- If user says "open 5" or "show me the 2nd paper",
-  action="open" and index=number (1-based).
+- If user message is just a topic like "ai in healthcare", treat as action="search" with topic="ai in healthcare".
+- If user says only an author constraint like "papers by Andrew Ng", action="search", topic="" and author="Andrew Ng".
 
-- If user says "open <TITLE>" or "show me the paper titled <TITLE>",
-  action="open" and title=<TITLE> (and index=null).
+Slot extraction for OPEN:
+- index: if user says "open 5" / "5th paper" / "show me the 2nd paper" (1-based)
+- title: if user says "open <TITLE>" / "paper titled <TITLE>"
+- arxiv_id: if user says "paper 2103.14954"
 
-- If user says "paper 2103.14954",
-  action="paper" and arxiv_id="2103.14954".
+Other commands:
+- next: "next", "more results", "next page", "show more results"
+- help: "what can you do", "commands", "how does this work", "examples"
+- reset: ONLY "reset", "clear", "start over"
 
-- If user asks what you can do or commands, action="help".
-
-- If user says reset or clear, action="reset".
-
-- Otherwise action="chat" and provide short friendly chat_response.
+Otherwise:
+- action="chat" and provide a short friendly chat_response.
 
 Field defaults:
 - Use empty string "" for missing strings.
@@ -197,6 +220,14 @@ class LLMClient:
                 index = int(idx)
             except Exception:
                 index = None
+
+        # Extra safety guard: never "reset" unless user explicitly asked reset/clear.
+        # This prevents accidental "reset" outputs for confirmations.
+        msg_low = (user_message or "").strip().lower()
+        if action == "reset" and not any(k in msg_low for k in ("reset", "clear", "start over", "restart")):
+            action = "chat"
+            if not chat_response:
+                chat_response = ""
 
         return {
             "action": action,

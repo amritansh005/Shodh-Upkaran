@@ -38,6 +38,26 @@ class ChatService:
         self.hard_total_cap = max(100, int(hard_total_cap))
 
     # -----------------------------
+    # Pending "Is it a new search?" confirmation handling
+    # (Small additions; does NOT disrupt existing logic)
+    # -----------------------------
+    _YES_RE = re.compile(
+        r"^(?:y|yes|yeah|yep|ok|okay|sure|do it|go ahead|new search|yes its a new search|yes it's a new search)\b",
+        re.IGNORECASE,
+    )
+    _NO_RE = re.compile(r"^(?:n|no|nope|nah)\b", re.IGNORECASE)
+    _CANCEL_RE = re.compile(r"^(?:forget it|never mind|nevermind|cancel|drop it|ignore that)\b", re.IGNORECASE)
+
+    def _is_yes(self, msg: str) -> bool:
+        return bool(self._YES_RE.match((msg or "").strip()))
+
+    def _is_no(self, msg: str) -> bool:
+        return bool(self._NO_RE.match((msg or "").strip()))
+
+    def _is_cancel(self, msg: str) -> bool:
+        return bool(self._CANCEL_RE.match((msg or "").strip()))
+
+    # -----------------------------
     # Public entrypoint (LLM-only routing)
     # -----------------------------
 
@@ -49,6 +69,49 @@ class ChatService:
 
         if not msg:
             return "Say something 🙂 (try: `search ai in healthcare`)", [], self._meta(state)
+
+        # -----------------------------
+        # NEW: Handle pending "new search?" confirmation BEFORE calling LLM
+        # -----------------------------
+        pending = (state.meta or {}).get("pending_search")
+        if pending:
+            if self._is_yes(msg):
+                # Confirmed -> directly run the stored search
+                state.meta.pop("pending_search", None)
+
+                topic = str(pending.get("topic") or "").strip()
+                author = str(pending.get("author") or "").strip()
+                from_year = pending.get("from_year", None)
+                to_year = pending.get("to_year", None)
+                categories = pending.get("categories") or []
+
+                print(f"[CHATBOT] pending_search confirmed -> topic={topic!r}, author={author!r}, years={from_year}-{to_year}, cats={categories!r}")
+
+                return await self._do_search(
+                    state,
+                    topic=topic,
+                    author=author,
+                    from_year=from_year,
+                    to_year=to_year,
+                    categories=categories,
+                )
+
+            if self._is_no(msg) or self._is_cancel(msg):
+                # Denied/canceled -> stay in current results and guide open-by-number/title
+                state.meta.pop("pending_search", None)
+                print("[CHATBOT] pending_search denied/cancelled -> staying in current results")
+
+                return (
+                    "Okay — staying with the current results. "
+                    "Please specify which paper to open by serial number (example: `open 7`) or paste the title.",
+                    [],
+                    self._meta(state),
+                )
+
+            # Neither approval nor denial: user changed request (e.g. "Forget it. Search ai in healthcare")
+            # Clear pending and proceed normally.
+            state.meta.pop("pending_search", None)
+            print("[CHATBOT] pending_search cleared due to new user request (not yes/no)")
 
         # LLM routing + slot extraction
         intent = self.llm.parse_intent(
@@ -161,6 +224,7 @@ class ChatService:
 
         # Safety fallback
         return "Unknown request. Type `help` to see allowed actions.", [], self._meta(state)
+
     async def _do_search(
         self,
         state,
@@ -176,7 +240,7 @@ class ChatService:
             author=author,
             from_year=from_year,
             to_year=to_year,
-            categories=categories,
+            categories=categories or [],
         )
         # Keep structured search inputs as well
         state.meta["search"] = {
@@ -517,7 +581,7 @@ class ChatService:
 
         - Try within current page (state.last_results) first.
         - Then try within all loaded results (state.prefetched_results).
-        - Only if zero reasonable candidates exist, suggest a new search (do not auto-search).
+        - Only if zero reasonable candidates exist, ask whether it is a new search.
         """
         author = str(intent.get("author") or "").strip()
         topic = str(intent.get("topic") or "").strip()
@@ -669,23 +733,39 @@ class ChatService:
             )
             return txt, loaded_matches[:10], self._meta(state)
 
-        # Zero reasonable candidates in current list → suggest a new search instead of jumping to it.
+        # Zero reasonable candidates in current list -> ask if it's a new search, and store pending search
         hint_parts: List[str] = []
         if author:
             hint_parts.append(f"by **{author}**")
         if topic:
             hint_parts.append(f"about **{topic}**")
-        if from_year is not None or to_year is not None:
-            fy = str(from_year) if from_year is not None else ""
-            ty = str(to_year) if to_year is not None else ""
-            hint_parts.append(f"between **{fy}** and **{ty}**".strip())
+        if from_year is not None and to_year is not None:
+            hint_parts.append(f"between **{from_year}** and **{to_year}**")
+        elif from_year is not None:
+            hint_parts.append(f"from **{from_year}**")
+        elif to_year is not None:
+            hint_parts.append(f"until **{to_year}**")
+
         hint = " ".join(hint_parts).strip() or "that"
 
+        state.meta["pending_search"] = {
+            "topic": topic,
+            "author": author,
+            "from_year": from_year,
+            "to_year": to_year,
+            "categories": intent.get("categories") or [],
+        }
+
+        print(f"[CHATBOT] pending_search set -> {state.meta['pending_search']}")
+
         return (
-            f"I don't see {hint} in the current results. If you want a new search, say: `search {topic or author}` (include years if needed).",
+            f"I don't see {hint} in the current results. Is it a new search?\n"
+            f"- If **yes**, reply `yes` and I'll search for it.\n"
+            f"- If **no**, tell me which paper to open (serial number like `open 7` or paste the title).",
             [],
             self._meta(state),
         )
+
     _WS_RE = re.compile(r"\s+")
     _PUNCT_RE = re.compile(r"[^a-z0-9\s]")
 
@@ -1038,7 +1118,6 @@ class ChatService:
             "- cs.AI papers between 2020 and 2022\n"
         )
 
-    
     def _describe_search(
         self,
         topic: str,
@@ -1057,13 +1136,13 @@ class ChatService:
         if topic:
             parts.append(topic)
         if author:
-            parts.append(f'by {author}')
+            parts.append(f"by {author}")
         if from_year is not None and to_year is not None:
-            parts.append(f'between {from_year} and {to_year}')
+            parts.append(f"between {from_year} and {to_year}")
         elif from_year is not None:
-            parts.append(f'from {from_year}')
+            parts.append(f"from {from_year}")
         elif to_year is not None:
-            parts.append(f'until {to_year}')
+            parts.append(f"until {to_year}")
         if categories:
             parts.append("in " + ", ".join(categories))
         # Fallback (shouldn't happen because we validate at least one constraint)
@@ -1079,4 +1158,6 @@ class ChatService:
             "prefetch_max_results": self.prefetch_max_results,
             "prefetch_chunk_size": self.prefetch_chunk_size,
             "hard_total_cap": self.hard_total_cap,
+            # NEW: small meta signal for the LLM (does not disrupt anything)
+            "pending_search": bool((state.meta or {}).get("pending_search")),
         }
