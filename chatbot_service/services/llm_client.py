@@ -15,7 +15,7 @@ Return ONLY valid JSON. No markdown. No explanation. No extra text.
 Schema (ALWAYS include all fields):
 
 {
-  "action": "search" | "summary" | "open" | "next" | "help" | "reset" | "paper" | "chat",
+  "action": "search" | "summary" | "open" | "next" | "help" | "reset" | "paper" | "ask" | "chat",
   "topic": string,
   "author": string,
   "from_year": integer or null,
@@ -24,16 +24,22 @@ Schema (ALWAYS include all fields):
   "index": integer or null,
   "title": string,
   "arxiv_id": string,
+  "question": string,
   "chat_response": string
 }
 
 Core actions:
 - search: user wants a NEW list of papers (topic/author/year/categories constraints)
-- summary: user wants details/abstract/summary/data-related info about ONE specific paper
-- open: user wants the PDF/download link for ONE specific paper
+- summary: user wants details/abstract/summary/data-related info about ONE specific paper (abstract/metadata)
+- open: user wants to open/download a paper — this triggers PDF ingestion into the vector DB
 - next: user wants more results of the CURRENT list
 - reset: ONLY when user explicitly says reset/clear/start over (never use reset for "yes" confirmations)
 - paper: user provided an explicit arXiv id (e.g. "paper 2003.10303")
+- ask: user is asking a QUESTION about the currently opened paper content (methodology, results,
+  findings, datasets, conclusion, equations, tables, etc.). Use ask when a paper has been opened
+  and the user queries its actual content — NOT its metadata or abstract.
+  Examples (=> ask): "what methodology did they use?", "what are the main findings?",
+  "explain the conclusion", "what datasets were used?", "what does table 2 show?"
 - help: commands/capabilities
 - chat: small talk / acknowledgements / ambiguous replies
 
@@ -103,6 +109,7 @@ Output:
   "index": null,
   "title": "",
   "arxiv_id": "",
+  "question": "",
   "chat_response": ""
 }
 
@@ -112,6 +119,25 @@ Output: action="summary", index=1
 
 Input: "download the 1st paper"
 Output: action="open", index=1
+
+ASK examples (user asking about content of the currently opened paper):
+Input: "what methodology did they use?"
+Output: action="ask", question="what methodology did they use?"
+
+Input: "what are the main findings of this paper?"
+Output: action="ask", question="what are the main findings of this paper?"
+
+Input: "explain the conclusion"
+Output: action="ask", question="explain the conclusion"
+
+Input: "what datasets were used?"
+Output: action="ask", question="what datasets were used?"
+
+Input: "what does table 2 show?"
+Output: action="ask", question="what does table 2 show?"
+
+NOTE: Use action="ask" ONLY when a paper has already been opened in the session
+(session state has an active_paper_arxiv_id). If no paper is open, fall back to action="chat".
 
 Other commands:
 - next: "next", "more results", "next page", "show more results"
@@ -128,6 +154,7 @@ Field defaults:
 """
 
 
+# Greedy enough for most cases; we still try direct json.loads first.
 _JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -152,7 +179,7 @@ class LLMClient:
             return ""
 
         resp = self.client.chat.completions.create(
-            model=self.deployment,
+            model=self.deployment,  # Azure expects deployment name here
             messages=messages,
             temperature=temperature,
         )
@@ -178,6 +205,7 @@ class LLMClient:
                 "index": None,
                 "title": "",
                 "arxiv_id": "",
+                "question": "",
                 "chat_response": "LLM not configured properly.",
             }
 
@@ -200,7 +228,7 @@ class LLMClient:
 
         # Normalize and enforce schema
         action = str(data.get("action") or "chat").strip().lower()
-        allowed = {"search", "summary", "open", "next", "help", "reset", "paper", "chat"}
+        allowed = {"search", "summary", "open", "next", "help", "reset", "paper", "ask", "chat"}
         if action not in allowed:
             action = "chat"
 
@@ -229,6 +257,7 @@ class LLMClient:
 
         title = str(data.get("title") or "").strip()
         arxiv_id = str(data.get("arxiv_id") or "").strip()
+        question = str(data.get("question") or "").strip()
         chat_response = str(data.get("chat_response") or "").strip()
 
         idx = data.get("index", None)
@@ -239,13 +268,21 @@ class LLMClient:
             except Exception:
                 index = None
 
-        # Extra safety guard: never "reset" unless user explicitly asked reset/clear.
+        # Extra safety guard: never "reset" unless user explicitly asked reset/clear/start over.
         # This prevents accidental "reset" outputs for confirmations.
         msg_low = (user_message or "").strip().lower()
         if action == "reset" and not any(k in msg_low for k in ("reset", "clear", "start over", "restart")):
             action = "chat"
             if not chat_response:
                 chat_response = ""
+
+        # Enforce ask only when a paper is actually open in session.
+        # If no paper is open, fall back to chat for a better UX.
+        if action == "ask" and not str(session_state.get("active_paper_arxiv_id") or "").strip():
+            action = "chat"
+            if not chat_response:
+                chat_response = "Open a paper first (example: `open 1`), then ask your question."
+            question = ""
 
         return {
             "action": action,
@@ -257,6 +294,7 @@ class LLMClient:
             "index": index,
             "title": title,
             "arxiv_id": arxiv_id,
+            "question": question,
             "chat_response": chat_response,
         }
 

@@ -1,8 +1,24 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Environment
 .env
-venv/
 .env.*
+venv/
+.venv/
+env/
+
+# IDE
 .DS_Store
 .idea/
 .vscode/
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db

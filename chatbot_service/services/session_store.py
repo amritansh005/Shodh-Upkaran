@@ -28,6 +28,10 @@ class SessionState:
     # Any additional metadata you already keep
     meta: Dict[str, Any] = field(default_factory=dict)
 
+    # Active paper for Q&A (set when user does "open <n>")
+    active_paper_arxiv_id: str = ""
+    active_paper_title: str = ""
+
 
 class InMemorySessionStore:
     def __init__(self) -> None:

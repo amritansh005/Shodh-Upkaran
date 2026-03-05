@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment
+.env
+.env.*
+venv/
+.venv/
+env/
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Temp files created by pdf_extractor.py (NamedTemporaryFile leftovers)
+*.tmp
+tmp/
+
+# Downloaded PDFs (stored temporarily during ingestion)
+*.pdf
+
+# ML model cache (BAAI/bge-large-en-v1.5 — 1.3GB, never commit this)
+.cache/
+models/
+huggingface/
+sentence_transformers/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+Thumbs.db

@@ -111,8 +111,6 @@ class QueryNormalizer:
         return ",".join(cleaned)
 
     @classmethod
-    
-    @classmethod
     def normalize_author(cls, author: Optional[str]) -> str:
         a = (author or "").strip().lower()
         a = a.replace('"', "").replace("'", "")
@@ -127,7 +125,8 @@ class QueryNormalizer:
             return ""
         return f"{fy}-{ty}"
 
-def normalize_arxiv_id(cls, arxiv_id: str) -> str:
+    @classmethod
+    def normalize_arxiv_id(cls, arxiv_id: str) -> str:
         # accept "arxiv:xxxx", "xxxxv2", "http://arxiv.org/abs/xxxxv2"
         s = (arxiv_id or "").strip().lower()
 

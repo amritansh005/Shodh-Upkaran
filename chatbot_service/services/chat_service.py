@@ -27,10 +27,12 @@ class ChatService:
         prefetch_max_results: int = 200,
         prefetch_chunk_size: int = 200,
         hard_total_cap: int = 5000,
+        pdf_ingestion_client=None,
     ) -> None:
         self.arxiv = arxiv
         self.llm = llm
         self.store = store
+        self.pdf_client = pdf_ingestion_client   # PDFIngestionClient | None
 
         self.page_size_default = max(1, int(page_size_default))
         self.prefetch_max_results = max(1, int(prefetch_max_results))
@@ -151,6 +153,7 @@ class ChatService:
         title = (intent.get("title") or "").strip()
         arxiv_id = (intent.get("arxiv_id") or "").strip()
         chat_response = (intent.get("chat_response") or "").strip()
+        question = (intent.get("question") or "").strip()
 
         # -----------------------------
         # Session-first resolution (confidence thresholds)
@@ -247,6 +250,10 @@ class ChatService:
                 return "Usage: `paper <arxiv_id>` (example: `paper 2003.10303`)", [], self._meta(state)
             mode = "pdf" if self._wants_pdf(msg) else "summary"
             return await self._do_paper(state, arxiv_id, mode=mode)
+
+        # Q&A over an ingested paper
+        if action == "ask":
+            return await self._do_ask(state, question or msg)
 
         # chat / small-talk
         if action == "chat":
@@ -359,7 +366,7 @@ class ChatService:
         if state.last_results and 1 <= idx <= len(state.last_results):
             print(f"[CHATBOT] open served from CURRENT PAGE cache (idx={idx}, cursor_start={state.cursor_start})")
             paper = state.last_results[idx - 1]
-            return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
+            return await self._open_paper(state, paper, mode=mode)
 
         # Otherwise interpret as "open Nth overall in this search"
         global_index = idx - 1
@@ -370,7 +377,7 @@ class ChatService:
             return "That index is beyond the results I have.", [], self._meta(state)
 
         paper = state.prefetched_results[global_index]
-        return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
+        return await self._open_paper(state, paper, mode=mode)
 
     async def _do_open_title(
         self, state, raw_title: str, mode: str = "pdf"
@@ -393,7 +400,7 @@ class ChatService:
         for _ in range(max_rounds):
             paper, candidates = self._find_best_title_match(state, query)
             if paper is not None:
-                return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
+                return await self._open_paper(state, paper, mode=mode)
 
             if candidates:
                 lines = [
@@ -648,7 +655,7 @@ class ChatService:
         if title:
             paper, cands = self._title_best_in(page_view, title)
             if paper is not None:
-                return self._format_paper_by_mode(paper, mode=mode), [paper], self._meta(state)
+                return await self._open_paper(state, paper, mode=mode)
 
             if cands:
                 if self._wants_show_all(user_message):
@@ -662,7 +669,7 @@ class ChatService:
 
                 if self._wants_choose_one(user_message):
                     chosen = cands[0]
-                    return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
+                    return await self._open_paper(state, chosen, mode=mode)
 
                 txt = self._format_candidate_choices(
                     state,
@@ -674,7 +681,7 @@ class ChatService:
 
             paper2, cands2 = self._title_best_in(loaded, title)
             if paper2 is not None:
-                return self._format_paper_by_mode(paper2, mode=mode), [paper2], self._meta(state)
+                return await self._open_paper(state, paper2, mode=mode)
 
             if cands2:
                 if self._wants_show_all(user_message):
@@ -688,7 +695,7 @@ class ChatService:
 
                 if self._wants_choose_one(user_message):
                     chosen = cands2[0]
-                    return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
+                    return await self._open_paper(state, chosen, mode=mode)
 
                 txt = self._format_candidate_choices(
                     state,
@@ -715,7 +722,7 @@ class ChatService:
 
         if len(page_matches) == 1:
             p = page_matches[0]
-            return self._format_paper_by_mode(p, mode=mode), [p], self._meta(state)
+            return await self._open_paper(state, p, mode=mode)
 
         if len(page_matches) > 1:
             if self._wants_show_all(user_message):
@@ -729,7 +736,7 @@ class ChatService:
 
             if self._wants_choose_one(user_message):
                 chosen = page_matches[0]
-                return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
+                return await self._open_paper(state, chosen, mode=mode)
 
             txt = self._format_candidate_choices(
                 state,
@@ -750,7 +757,7 @@ class ChatService:
 
         if len(loaded_matches) == 1:
             p = loaded_matches[0]
-            return self._format_paper_by_mode(p, mode=mode), [p], self._meta(state)
+            return await self._open_paper(state, p, mode=mode)
 
         if len(loaded_matches) > 1:
             if self._wants_show_all(user_message):
@@ -764,7 +771,7 @@ class ChatService:
 
             if self._wants_choose_one(user_message):
                 chosen = loaded_matches[0]
-                return self._format_paper_by_mode(chosen, mode=mode), [chosen], self._meta(state)
+                return await self._open_paper(state, chosen, mode=mode)
 
             txt = self._format_candidate_choices(
                 state,
@@ -882,13 +889,13 @@ class ChatService:
                 return f"No paper found for arXiv id: {arxiv_id}", [], self._meta(state)
 
             paper_dict = self._paper_to_dict(paper)
-            return self._format_paper_by_mode(paper_dict, mode=mode), [paper_dict], self._meta(state)
+            return await self._open_paper(state, paper_dict, mode=mode)
 
         except Exception:
             for p in state.prefetched_results:
                 pid = str(p.get("arxiv_id") or p.get("id") or "")
                 if pid == arxiv_id:
-                    return self._format_paper_by_mode(p, mode=mode), [p], self._meta(state)
+                    return await self._open_paper(state, p, mode=mode)
             return f"No paper found for arXiv id: {arxiv_id}", [], self._meta(state)
 
     # -----------------------------
@@ -1118,8 +1125,109 @@ class ChatService:
 
         return "\n".join(lines)
 
+    # -----------------------------
+    # Central paper opener — routes to ingest or summary
+    # -----------------------------
+
+    async def _open_paper(
+        self,
+        state,
+        paper: Dict[str, Any],
+        mode: str = "summary",
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Central handler for opening a single paper.
+        - summary mode: return metadata + abstract, no download.
+        - open/pdf mode: trigger ingestion via pdf_ingestion service.
+        Always records the paper as the session's active_paper for Q&A.
+        """
+        m = (mode or "summary").strip().lower()
+
+        arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+        title    = str(paper.get("title") or "").strip()
+        if arxiv_id:
+            state.active_paper_arxiv_id = arxiv_id
+            state.active_paper_title    = title
+
+        if m in ("pdf", "open", "download"):
+            return await self._do_open_ingest(state, paper)
+        else:
+            reply = self._format_paper_summary_reply(paper)
+            return reply, [paper], self._meta(state)
+
+    async def _do_open_ingest(
+        self,
+        state,
+        paper: Dict[str, Any],
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Call the pdf_ingestion service to download + process a paper.
+
+        Shows "Downloading......" then either:
+        - "Paper downloaded. So what do you want to know about this paper?"
+        - A specific error message explaining exactly what went wrong (no PDF link fallback).
+        """
+        if not self.pdf_client:
+            return (
+                "The PDF ingestion service is not configured. "
+                "Please set PDF_INGESTION_BASE_URL in chatbot_service/.env.",
+                [],
+                self._meta(state),
+            )
+
+        arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
+        title    = str(paper.get("title") or "").strip() or "Untitled"
+        print(f"[CHATBOT] INGEST start: arxiv_id={arxiv_id!r} title={title!r}")
+
+        result  = await self.pdf_client.ingest(paper)
+        status  = result.get("status", "failed")
+        message = result.get("message", "")
+
+        if status in ("ready", "already_ready"):
+            reply = f"Downloading......\n\n{message}\n\nSo what do you want to know about this paper?"
+        else:
+            # specific error from downloader/extractor/service — shown as-is
+            reply = f"Downloading......\n\n{message}"
+
+        return reply, [paper], self._meta(state)
+
+    async def _do_ask(
+        self,
+        state,
+        question: str,
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """Handle a Q&A question about the currently opened paper."""
+        if not self.pdf_client:
+            return (
+                "The PDF ingestion service is not configured. "
+                "Please set PDF_INGESTION_BASE_URL in chatbot_service/.env.",
+                [],
+                self._meta(state),
+            )
+
+        arxiv_id    = getattr(state, "active_paper_arxiv_id", "") or ""
+        paper_title = getattr(state, "active_paper_title", "") or ""
+
+        if not arxiv_id:
+            return (
+                "No paper is currently loaded. Open a paper first (example: `open 1`).",
+                [],
+                self._meta(state),
+            )
+
+        print(f"[CHATBOT] ASK arxiv_id={arxiv_id!r} question={question!r}")
+
+        answer = await self.pdf_client.ask(
+            arxiv_id=arxiv_id,
+            question=question,
+            paper_title=paper_title,
+        )
+
+        header = f"**{paper_title}**\n\n" if paper_title else ""
+        return f"{header}{answer}", [], self._meta(state)
+
     # --------
-    # NEW: two output styles for a selected paper
+    # two output styles for a selected paper
     # --------
     def _format_paper_summary_reply(self, p: Dict[str, Any]) -> str:
         title = (p.get("title") or "").strip() or "Untitled"
@@ -1207,17 +1315,20 @@ class ChatService:
             "- `search ... in <category>` (e.g., cs.AI, cs.LG, stat.ML)\n"
             "- `next`\n"
             "- `summary <n>` (shows abstract/details for nth paper on current page)\n"
-            "- `open <n>` (shows PDF link for nth paper on current page; if not on page, tries nth overall)\n"
-            "- `open <title>` (shows PDF link for best matching paper title from current search)\n"
+            "- `open <n>` (downloads paper into DB and enables Q&A)\n"
+            "- `open <title>` (downloads best matching paper from current search)\n"
             "- `paper <arxiv_id>` (shows details)\n"
-            "- `paper <arxiv_id> pdf` (shows PDF link)\n\n"
+            "- After opening a paper, ask any question about its content:\n"
+            "  e.g. `what methodology did they use?`\n"
+            "       `what datasets were used?`\n"
+            "       `what are the main findings?`\n\n"
             "Examples:\n"
             "- ai in healthcare\n"
             "- papers by Andrew Ng\n"
             "- ai in healthcare between 2020 and 2022\n"
             "- cs.AI papers between 2020 and 2022\n"
             "- summarize the 1st paper\n"
-            "- open the 1st paper pdf\n"
+            "- open 1\n"
         )
 
     def _describe_search(
@@ -1262,4 +1373,6 @@ class ChatService:
             "hard_total_cap": self.hard_total_cap,
             # NEW: small meta signal for the LLM (does not disrupt anything)
             "pending_search": bool((state.meta or {}).get("pending_search")),
+            "active_paper_arxiv_id": getattr(state, "active_paper_arxiv_id", "") or "",
+            "active_paper_title": getattr(state, "active_paper_title", "") or "",
         }
