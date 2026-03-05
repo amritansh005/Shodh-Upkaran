@@ -119,6 +119,7 @@ def startup():
         app.state.qa_service  = None
         return
 
+    app.state.settings  = settings  # made available to routes for structural extraction
     paper_store = PaperStore(dsn=settings.postgres_dsn)
     paper_store.init_db()
     app.state.paper_store = paper_store

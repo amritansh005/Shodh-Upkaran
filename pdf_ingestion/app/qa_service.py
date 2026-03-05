@@ -2,24 +2,23 @@
 qa_service.py — RAG-based Q&A over ingested papers.
 
 Flow:
-    1. Detect if question is structural (headings, outline, etc.) → use full-doc mode.
-    2. Detect if question is about references/bibliography → use references mode.
-    3. Embed question with BGE query instruction prefix.
-    4. Similarity search in pgvector scoped to the paper's arxiv_id.
-    5. (References mode) Also include tail chunks because references are usually at the end.
-    6. Build context from retrieved chunks (with a max character cap).
-    7. Call GPT-4o with context + question.
-    8. Return answer string.
+    1. Ask GPT-4o to classify the question as structural / references / specific.
+    2. Embed question with BGE query instruction prefix.
+    3. Similarity search in pgvector scoped to the paper's arxiv_id.
+    4. (References mode) Also include tail chunks because references are usually at the end.
+    5. Build context from retrieved chunks (with a max character cap).
+    6. Call GPT-4o with context + question.
+    7. Return answer string.
 """
 
 from __future__ import annotations
 
 import logging
-import re
-from typing import List
+from typing import List, Literal
 
 from pdf_ingestion.app.paper_store import PaperStore, STATUS_READY
 from pdf_ingestion.app.embedder import get_embedder
+from pdf_ingestion.app.structural_extractor import HeadingTree
 
 logger = logging.getLogger(__name__)
 
@@ -34,32 +33,82 @@ FULL_DOC_MAX_CONTEXT_CHARS = 20000
 # --- References config (references/bibliography usually live at end of paper) ---
 REF_TOP_K = 80
 REF_MAX_CONTEXT_CHARS = 22000
-REF_TAIL_CHUNKS = 12  # always include the last N chunks for references questions
+REF_TAIL_CHUNKS = 25  # always include the last N chunks for references questions
 
-# Patterns that indicate the user wants a structural/overview answer
-# that requires content from across the whole paper, not top-k similarity hits
-_STRUCTURAL_PATTERNS = re.compile(
-    r"\b("
-    r"heading|headings|header|headers|section|sections|"
-    r"outline|table of contents|structure|structure of|"
-    r"chapter|chapters|topic|topics|covered|"
-    r"what does this paper cover|what is covered|"
-    r"overview|summary|summarize|summarise|"
-    r"main point|main points|key point|key points|"
-    r"conclusion|conclusions|finding|findings|result|results|outcome|outcomes|"
-    r"contribution|contributions|what did they|what was done|"
-    r"methodology|methods|approach|dataset|datasets|experiment|experiments"
-    r")\b",
-    re.IGNORECASE,
+# Question type labels returned by GPT-4o classifier
+QuestionType = Literal["structural", "references", "specific"]
+
+# Lightweight hard overrides (guardrails) to reduce misrouting
+# NOTE: These do NOT attempt to enumerate paper headings; they only detect question intent.
+_HARD_REFERENCES_KEYWORDS = (
+    "references",
+    "bibliography",
+    "works cited",
+    "citations",
+    "reference list",
+    "cited works",
 )
 
-# Patterns that indicate the user wants references/bibliography/citations
-_REFERENCES_PATTERNS = re.compile(
-    r"\b("
-    r"references|bibliography|works cited|citations|reference list|cited works"
-    r")\b",
-    re.IGNORECASE,
+_HARD_STRUCTURAL_KEYWORDS = (
+    "heading",
+    "headings",
+    "header",
+    "headers",
+    "outline",
+    "table of contents",
+    "toc",
+    "sections",
+    "structure",
+    "chapter",
+    "chapters",
 )
+
+# Keywords that specifically mean "list the headings/structure" —
+# for these we answer directly from the stored HeadingTree, no embeddings needed.
+_HEADING_QUERY_KEYWORDS = (
+    "heading",
+    "headings",
+    "header",
+    "headers",
+    "outline",
+    "table of contents",
+    "toc",
+)
+
+_HEADING_SYSTEM_PROMPT = """You are a precise research assistant. You are given the complete section
+heading outline of a research paper, extracted visually from page images.
+
+Rules:
+- List the headings EXACTLY as provided — do not add, remove, or rename any.
+- Use a bullet list with dashes (-).
+- Indent sub-headings (level 2) with two spaces, sub-sub-headings (level 3) with four.
+- Include the page number in parentheses at the end of each line,
+  e.g.:  - I. Introduction  (page 1)
+- Do NOT add any commentary, caveats, or extra text beyond the list.
+"""
+
+_CLASSIFIER_SYSTEM_PROMPT = """You are a router for a research-paper Q&A system.
+
+Classify the user's question into EXACTLY ONE label:
+
+structural:
+- asks for headings/sections/outline/table of contents/structure
+- asks for overview/summary/key takeaways/main points/contributions
+- asks to explain or summarize a SECTION or broad topic, e.g.:
+  applications, use cases, implications, limitations, discussion, future work,
+  conclusion, results, findings, methodology, approach, datasets, experiments
+- asks for a brief description like “in 2–3 lines” about a broad part of the paper
+
+references:
+- asks for references/bibliography/citations/works cited/reference list
+
+specific:
+- asks for a single narrow fact/value/definition/equation/detail from a small passage
+
+Output rules:
+- Reply with ONLY one of these three words: structural, references, specific
+- No punctuation. No extra words. No explanation.
+"""
 
 _QA_SYSTEM_PROMPT = """\
 You are a precise research assistant. You are given excerpts from a scientific \
@@ -81,12 +130,15 @@ and a question about its references/bibliography.
 
 Rules:
 - ONLY list references that are explicitly present in the provided text.
-- Do NOT invent citations or author names.
+- Copy each reference EXACTLY and VERBATIM as it appears in the text — do NOT paraphrase,
+  summarize, shorten, or rewrite any reference in any way.
+- Do NOT merge multiple references into a single line. Each reference must be on its own line.
+- Do NOT invent citations, author names, titles, or any other detail.
+- Do NOT add any commentary, annotations, or descriptions alongside the references.
 - If the references section is not present in the excerpts, say exactly:
   "I couldn't find the full references in the paper. Try asking something else."
 - If the user asks to "list" or "show" references and only a partial list is present,
-  list ONLY what is present and mention that it appears partial.
-- Keep each reference on its own line. Do not add commentary.
+  list ONLY what is present verbatim, then add a single line: "Note: This list appears to be partial."
 """
 
 _STRUCTURAL_SYSTEM_PROMPT = """\
@@ -95,8 +147,17 @@ paper (split into chunks) and a question about its structure or content.
 
 Rules:
 - Answer from the provided text. Do not use outside knowledge.
-- For questions about headings/sections/structure: list every distinct section \
-  heading you can find in the text, in order.
+- For questions about headings/sections/structure: list ONLY genuine section and \
+  subsection headings — these are the titled divisions of the paper such as \
+  Abstract, Introduction, Related Work, Methodology, Results, Discussion, \
+  Conclusion, Future Work, and any numbered or named sub-sections. \
+  Use a BULLET LIST (dash "-") — do NOT use a numbered list. \
+  Reproduce each heading EXACTLY as it appears in the text \
+  (including any section number already in the heading, e.g. \
+  "1 Introduction", "4.1 LIME"). Never add your own numbering on top.
+- Do NOT include figure captions (e.g. "Figure 1. ..."), table titles \
+  (e.g. "Table 2. ..."), or any other non-heading labels in the list.
+- For sub-sections, indent them with two extra spaces under their parent section.
 - For questions about findings/outcomes/results: summarize what the paper \
   explicitly states.
 - For questions about methodology/datasets: describe what is stated in the text.
@@ -114,13 +175,65 @@ class QAService:
         self._store = store
         self._llm = llm_client
 
-    def _is_structural_question(self, question: str) -> bool:
-        """Detect questions that need full-document context rather than top-k similarity."""
-        return bool(_STRUCTURAL_PATTERNS.search(question))
+    def _hard_route(self, question: str) -> QuestionType | None:
+        """
+        Cheap, deterministic routing for obvious cases.
+        Returns a QuestionType if confidently matched, else None.
+        """
+        q = (question or "").strip().lower()
+        if not q:
+            return None
 
-    def _is_references_question(self, question: str) -> bool:
-        """Detect questions specifically about references/bibliography/citations."""
-        return bool(_REFERENCES_PATTERNS.search(question))
+        # References overrides structural if both appear.
+        if any(k in q for k in _HARD_REFERENCES_KEYWORDS):
+            return "references"
+
+        if any(k in q for k in _HARD_STRUCTURAL_KEYWORDS):
+            return "structural"
+
+        return None
+
+    def _classify_question(self, question: str) -> QuestionType:
+        """
+        Ask GPT-4o to classify the question as one of:
+          'structural' | 'references' | 'specific'
+
+        Falls back to 'specific' if the LLM is unavailable or returns
+        an unexpected label, so retrieval always continues.
+        """
+
+        # Hard routing guardrails first (fast + stable)
+        hard = self._hard_route(question)
+        if hard is not None:
+            logger.info("[QA] Hard-routed question as '%s': %r", hard, question)
+            return hard
+
+        # If LLM isn't available, keep behavior stable and proceed with specific mode.
+        if not self._llm.enabled():
+            logger.warning("[QA] LLM not available for classification, defaulting to 'specific'")
+            return "specific"
+
+        try:
+            raw = self._llm.chat(
+                messages=[
+                    {"role": "system", "content": _CLASSIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.0,
+            )
+
+            # Robust normalization: strip whitespace + common punctuation
+            label = (raw or "").strip().lower().strip(" \t\r\n.:-\"'`")
+
+            if label in ("structural", "references", "specific"):
+                logger.info("[QA] GPT-4o classified question as '%s': %r", label, question)
+                return label  # type: ignore[return-value]
+
+            logger.warning("[QA] Unexpected classification label %r, defaulting to 'specific'", raw)
+        except Exception as e:
+            logger.error("[QA] Classification call failed: %s — defaulting to 'specific'", e)
+
+        return "specific"
 
     def answer(self, arxiv_id: str, question: str, paper_title: str = "") -> str:
         """
@@ -143,9 +256,48 @@ class QAService:
                 return "The paper is still being processed. Please try again in a moment."
             return "This paper hasn't been ingested yet. Open it first with `open <n>`."
 
-        # Choose retrieval strategy based on question type
-        is_references = self._is_references_question(question)
-        is_structural = self._is_structural_question(question) or is_references
+        # ── Fast path: heading queries answered from stored HeadingTree ───────
+        # At ingest time, GPT-4o vision read every page as an image and
+        # extracted the heading structure.  For queries asking "what are the
+        # headings / outline / table of contents", we skip embedding retrieval
+        # entirely and answer directly from that stored data.
+        _q = question.lower()
+        if any(k in _q for k in _HEADING_QUERY_KEYWORDS):
+            stored_json = self._store.get_headings(arxiv_id)
+            if stored_json:
+                tree = HeadingTree.from_json(stored_json)
+                if not tree.is_empty():
+                    logger.info(
+                        "[QA] Heading fast-path: %d headings stored for %s",
+                        len(tree.headings), arxiv_id,
+                    )
+                    heading_outline = tree.format_for_llm()
+                    if not self._llm.enabled():
+                        return heading_outline
+                    try:
+                        answer = self._llm.chat(
+                            messages=[
+                                {"role": "system", "content": _HEADING_SYSTEM_PROMPT},
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        (f"Paper: {paper_title}\n\n" if paper_title else "")
+                                        + f"Heading outline:\n{heading_outline}\n\n"
+                                        + f"Question: {question}"
+                                    ),
+                                },
+                            ],
+                            temperature=0.0,
+                        )
+                        return answer.strip() if answer else heading_outline
+                    except Exception as _e:
+                        logger.error("[QA] Heading fast-path LLM call failed: %s", _e)
+                        return heading_outline
+
+        # Choose retrieval strategy based on GPT-4o question classification
+        question_type = self._classify_question(question)
+        is_references = question_type == "references"
+        is_structural = question_type in ("structural", "references")
 
         if is_references:
             top_k = REF_TOP_K

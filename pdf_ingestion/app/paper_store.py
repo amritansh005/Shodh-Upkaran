@@ -15,6 +15,7 @@ papers
     total_pages     INTEGER
     used_ocr        BOOLEAN
     error_msg       TEXT
+    paper_headings  TEXT   -- JSON: [{level,text,page}, ...]
     created_at      TIMESTAMPTZ
     updated_at      TIMESTAMPTZ
 
@@ -78,9 +79,16 @@ class PaperStore:
                         total_pages     INTEGER,
                         used_ocr        BOOLEAN DEFAULT FALSE,
                         error_msg       TEXT,
+                        paper_headings  TEXT,
                         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                """)
+
+                # Safe migration for existing databases
+                cur.execute("""
+                    ALTER TABLE papers
+                        ADD COLUMN IF NOT EXISTS paper_headings TEXT;
                 """)
 
                 cur.execute("""
@@ -196,8 +204,38 @@ class PaperStore:
             conn.commit()
 
     # ------------------------------------------------------------------
+    # Structural headings
+    # ------------------------------------------------------------------
+
+    def save_headings(self, arxiv_id: str, headings_json: str) -> None:
+        """Persist the extracted heading tree (JSON string) for a paper."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE papers
+                    SET paper_headings = %s, updated_at = NOW()
+                    WHERE arxiv_id = %s;
+                    """,
+                    (headings_json, arxiv_id),
+                )
+            conn.commit()
+
+    def get_headings(self, arxiv_id: str) -> Optional[str]:
+        """Return stored headings JSON, or None if not yet extracted."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT paper_headings FROM papers WHERE arxiv_id = %s;",
+                    (arxiv_id,),
+                )
+                row = cur.fetchone()
+                return row[0] if row else None
+
+    # ------------------------------------------------------------------
     # Chunk CRUD
     # ------------------------------------------------------------------
+
 
     def chunk_count(self, arxiv_id: str) -> int:
         with self._connect() as conn:

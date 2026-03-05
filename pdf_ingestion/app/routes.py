@@ -97,7 +97,8 @@ async def ingest(req: IngestRequest, request: Request):
         "published": req.published,
     }
 
-    result = await ingest_paper(paper=paper_dict, store=store)
+    settings = getattr(request.app.state, "settings", None)
+    result = await ingest_paper(paper=paper_dict, store=store, settings=settings)
     return IngestResponse(**result)
 
 
