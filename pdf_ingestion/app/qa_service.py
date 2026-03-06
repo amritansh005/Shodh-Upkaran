@@ -32,8 +32,8 @@ FULL_DOC_MAX_CONTEXT_CHARS = 20000
 
 # --- References config (references/bibliography usually live at end of paper) ---
 REF_TOP_K = 80
-REF_MAX_CONTEXT_CHARS = 22000
-REF_TAIL_CHUNKS = 25  # always include the last N chunks for references questions
+REF_MAX_CONTEXT_CHARS = 40000  # references lists are long — give them enough room
+REF_TAIL_CHUNKS = 30  # last 30 chunks covers ~12 pages, enough for any references section
 
 # Question type labels returned by GPT-4o classifier
 QuestionType = Literal["structural", "references", "specific"]
@@ -75,7 +75,8 @@ _HEADING_QUERY_KEYWORDS = (
     "toc",
 )
 
-_HEADING_SYSTEM_PROMPT = """You are a precise research assistant. You are given the complete section
+_HEADING_SYSTEM_PROMPT = """\
+You are a precise research assistant. You are given the complete section
 heading outline of a research paper, extracted visually from page images.
 
 Rules:
@@ -87,7 +88,8 @@ Rules:
 - Do NOT add any commentary, caveats, or extra text beyond the list.
 """
 
-_CLASSIFIER_SYSTEM_PROMPT = """You are a router for a research-paper Q&A system.
+_CLASSIFIER_SYSTEM_PROMPT = """\
+You are a router for a research-paper Q&A system.
 
 Classify the user's question into EXACTLY ONE label:
 
@@ -97,7 +99,7 @@ structural:
 - asks to explain or summarize a SECTION or broad topic, e.g.:
   applications, use cases, implications, limitations, discussion, future work,
   conclusion, results, findings, methodology, approach, datasets, experiments
-- asks for a brief description like “in 2–3 lines” about a broad part of the paper
+- asks for a brief description like "in 2–3 lines" about a broad part of the paper
 
 references:
 - asks for references/bibliography/citations/works cited/reference list
@@ -125,7 +127,7 @@ Rules:
 """
 
 _REFERENCES_SYSTEM_PROMPT = """\
-You are a precise research assistant. You are given excerpts from the END of a scientific paper
+You are a precise research assistant. You are given excerpts from a scientific paper
 and a question about its references/bibliography.
 
 Rules:
@@ -135,10 +137,12 @@ Rules:
 - Do NOT merge multiple references into a single line. Each reference must be on its own line.
 - Do NOT invent citations, author names, titles, or any other detail.
 - Do NOT add any commentary, annotations, or descriptions alongside the references.
-- If the references section is not present in the excerpts, say exactly:
-  "I couldn't find the full references in the paper. Try asking something else."
-- If the user asks to "list" or "show" references and only a partial list is present,
-  list ONLY what is present verbatim, then add a single line: "Note: This list appears to be partial."
+- If the excerpts contain ANY references at all, list every one of them verbatim.
+- If only a partial list is present, list what is there verbatim, then add one line:
+  "Note: This list may be incomplete — not all references were found in the retrieved excerpts."
+- ONLY say "I couldn't find the references in the paper." if there are genuinely zero
+  reference entries anywhere in the provided text. Do not say this if even one reference
+  is present.
 """
 
 _STRUCTURAL_SYSTEM_PROMPT = """\
@@ -258,7 +262,7 @@ class QAService:
 
         # ── Fast path: heading queries answered from stored HeadingTree ───────
         # At ingest time, GPT-4o vision read every page as an image and
-        # extracted the heading structure.  For queries asking "what are the
+        # extracted the heading structure. For queries asking "what are the
         # headings / outline / table of contents", we skip embedding retrieval
         # entirely and answer directly from that stored data.
         _q = question.lower()
@@ -341,11 +345,24 @@ class QAService:
                     tail_hits = []
 
             if tail_hits:
-                # Merge by chunk_index, keep existing similarity hits, add missing tail chunks
+                # Merge by chunk_index, deduplicate
                 merged = {ci: (ci, text, score) for ci, text, score in hits}
                 for ci, text, score in tail_hits:
                     merged.setdefault(ci, (ci, text, score))
-                hits = list(merged.values())
+                # Sort tail chunks FIRST (ascending document order), then similarity
+                # hits from the rest of the paper after. This guarantees references
+                # at the end of the paper are never cut off by the MAX_CONTEXT_CHARS
+                # cap — they go into context before chunks from the middle of the paper.
+                tail_indices = {ci for ci, _, _ in tail_hits}
+                tail_part = sorted(
+                    [v for v in merged.values() if v[0] in tail_indices],
+                    key=lambda h: h[0],   # ascending document order within tail
+                )
+                other_part = sorted(
+                    [v for v in merged.values() if v[0] not in tail_indices],
+                    key=lambda h: -h[2],  # descending similarity score
+                )
+                hits = tail_part + other_part
 
         # For structural questions: sort chunks by chunk_index (document order)
         # so headings and sections appear in reading order, not similarity order.
