@@ -88,24 +88,35 @@ app = FastAPI(title="PDF Ingestion Service", version="1.0")
 app.include_router(router)
 
 
-def _preload_embedder() -> None:
+def _preload_models() -> None:
     """
-    Eagerly load the BAAI/bge-large-en-v1.5 embedding model in a background
-    thread at startup so it is warm by the time the first paper is opened.
+    Eagerly load both the embedding model and Marker models in a background
+    thread at startup so they are warm before the first paper is opened.
 
-    Running in a daemon thread means:
-    - Server starts and accepts requests immediately (non-blocking).
-    - Model loads in the background (~30s on first run).
-    - Any 'open paper' request that arrives before the model is ready will
-      still work — it will just trigger the normal load at that point.
-      Subsequent requests will use the already-warm model.
+    Both models stay in memory (GPU VRAM for Marker, RAM for embedder)
+    for the lifetime of the process — no reloading between papers.
+
+    Running in a daemon thread means the server starts immediately and
+    accepts requests while models load in the background.
     """
+    # Load embedding model
     try:
-        logger.info("[pdf_ingestion] Pre-loading embedding model in background...")
+        logger.info("[pdf_ingestion] Pre-loading embedding model...")
         get_embedder()._load()
-        logger.info("[pdf_ingestion] Embedding model ready — warm and waiting.")
+        logger.info("[pdf_ingestion] Embedding model ready.")
     except Exception as e:
         logger.warning("[pdf_ingestion] Embedder pre-load failed (non-fatal): %s", e)
+
+    # Load Marker models onto GPU — kept in VRAM for the process lifetime
+    # Models are cached on disk after first download so this is just a
+    # GPU load (~10-20s), not a download.
+    try:
+        logger.info("[pdf_ingestion] Pre-loading Marker models onto GPU...")
+        from pdf_ingestion.app.vision_extractor import _get_converter
+        _get_converter()
+        logger.info("[pdf_ingestion] Marker models ready on GPU.")
+    except Exception as e:
+        logger.warning("[pdf_ingestion] Marker pre-load failed (non-fatal): %s", e)
 
 
 @app.on_event("startup")
@@ -142,7 +153,7 @@ def startup():
     # Kicks off immediately after startup so the model is warm before the
     # first 'open paper' request arrives. daemon=True ensures it doesn't
     # block server shutdown.
-    threading.Thread(target=_preload_embedder, daemon=True).start()
+    threading.Thread(target=_preload_models, daemon=True).start()
 
 
 @app.get("/health")

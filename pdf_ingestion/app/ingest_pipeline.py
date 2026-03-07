@@ -1,23 +1,23 @@
 """
-ingest_pipeline.py — Full pipeline: download → extract → chunk → embed → store.
-
-Returns a structured result dict that routes directly to user-facing messages.
-No fallbacks — failures return specific human-readable error reasons.
+ingest_pipeline.py — Full pipeline: download → Marker extract → chunk → embed → store.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 from pdf_ingestion.app.pdf_downloader import download_pdf
-from pdf_ingestion.app.pdf_extractor import extract_pdf
-from pdf_ingestion.app.chunker import chunk_pages
+from pdf_ingestion.app.chunker import chunk_sections
 from pdf_ingestion.app.embedder import get_embedder
 from pdf_ingestion.app.paper_store import PaperStore, STATUS_READY, STATUS_PROCESSING
-from pdf_ingestion.app.structural_extractor import extract_headings
+from pdf_ingestion.app.vision_extractor import extract_sections_via_vision
 
 logger = logging.getLogger(__name__)
+
+_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 
 async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) -> Dict[str, Any]:
@@ -74,101 +74,69 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         store.save_pdf_bytes(arxiv_id, dl.pdf_bytes)
         logger.info("[INGEST] Downloaded: %s  bytes=%d", arxiv_id, len(dl.pdf_bytes))
 
-        # ── 3b. Extract headings via GPT-4o vision ───────────────────────────
-        # Renders each page as an image and asks GPT-4o to identify headings
-        # visually — same approach Claude uses when reading PDFs natively.
-        # Stored in paper_headings column so heading queries skip embedding
-        # retrieval entirely and answer directly from the stored structure.
-        logger.info("[INGEST] Extracting headings via GPT-4o vision: %s", arxiv_id)
-        try:
-            heading_tree = extract_headings(
-                pdf_bytes   = dl.pdf_bytes,
-                endpoint    = getattr(settings, "azure_openai_endpoint",    "") if settings else "",
-                api_key     = getattr(settings, "azure_openai_api_key",     "") if settings else "",
-                api_version = getattr(settings, "azure_openai_api_version", "") if settings else "",
-                deployment  = getattr(settings, "azure_openai_deployment",  "") if settings else "",
-            )
-            if not heading_tree.is_empty():
-                store.save_headings(arxiv_id, heading_tree.to_json())
-                logger.info(
-                    "[INGEST] Headings stored: %s  count=%d",
-                    arxiv_id, len(heading_tree.headings),
-                )
-            elif heading_tree.error:
-                logger.warning(
-                    "[INGEST] Heading extraction skipped: %s  reason=%s",
-                    arxiv_id, heading_tree.error,
-                )
-            else:
-                logger.info("[INGEST] No headings detected in: %s", arxiv_id)
-        except Exception as _he:
-            # Non-fatal: text extraction + chunking continues regardless
-            logger.warning("[INGEST] Heading extraction raised unexpectedly: %s  err=%s", arxiv_id, _he)
+        # ── 4. Marker extraction ──────────────────────────────────────────────
+        logger.info("[INGEST] Starting Marker extraction: %s", arxiv_id)
 
-        # ── 4. Extract text ───────────────────────────────────────────────────
-        logger.info("[INGEST] Extracting text: %s", arxiv_id)
-        extraction = extract_pdf(dl.pdf_bytes)
+        loop = asyncio.get_running_loop()
 
-        if extraction.error:
-            store.mark_failed(arxiv_id, extraction.error)
-            return _fail(arxiv_id, f"Could not extract text from the PDF: {extraction.error}")
-
-        if not extraction.pages:
-            msg = "The PDF appears to contain no extractable text (may be fully image-based with no OCR support)."
-            store.mark_failed(arxiv_id, msg)
-            return _fail(arxiv_id, msg)
-
-        logger.info(
-            "[INGEST] Extracted: %s  pages=%d  used_ocr=%s",
-            arxiv_id, extraction.total_pages, extraction.used_ocr,
+        assembly, heading_tree, pdf_total_pages = await loop.run_in_executor(
+            _EXECUTOR,
+            lambda: extract_sections_via_vision(pdf_bytes=dl.pdf_bytes, settings=settings),
         )
 
-        # Log warning if any pages permanently failed
-        if extraction.failed_pages_note:
-            logger.warning("[INGEST] %s: %s", arxiv_id, extraction.failed_pages_note)
+        # ── 5. Check extraction result ────────────────────────────────────────
+        if assembly is None or assembly.is_empty():
+            reason = getattr(assembly, "error", None) or "Marker returned no sections."
+            logger.error("[INGEST] Extraction failed: %s  reason=%s", arxiv_id, reason)
+            store.mark_failed(arxiv_id, reason)
+            return _fail(arxiv_id, reason)
 
-        # ── 5. Chunk ──────────────────────────────────────────────────────────
-        chunks = chunk_pages(extraction.pages)
+        # ── 6. Store headings + sections ──────────────────────────────────────
+        if not heading_tree.is_empty():
+            store.save_headings(arxiv_id, heading_tree.to_json())
+            logger.info("[INGEST] Headings stored: %s  count=%d", arxiv_id, len(heading_tree.headings))
+
+        store.delete_sections(arxiv_id)
+        store.insert_sections(arxiv_id, assembly.sections)
+        logger.info("[INGEST] Sections stored: %s  count=%d", arxiv_id, len(assembly.sections))
+
+        # ── 7. Chunk ──────────────────────────────────────────────────────────
+        chunks = chunk_sections(assembly.sections)
+
         if not chunks:
-            msg = "The PDF was extracted but produced no text chunks. The paper may be empty or unreadable."
+            msg = "Marker extracted sections but produced no text chunks."
             store.mark_failed(arxiv_id, msg)
             return _fail(arxiv_id, msg)
 
         logger.info("[INGEST] Chunked: %s  chunks=%d", arxiv_id, len(chunks))
 
-        # ── 6. Embed ──────────────────────────────────────────────────────────
+        # ── 8. Embed ──────────────────────────────────────────────────────────
         logger.info("[INGEST] Embedding: %s", arxiv_id)
         embedder = get_embedder()
-        texts   = [c.text for c in chunks]
-        vectors = embedder.embed_documents(texts)
+        vectors  = embedder.embed_documents([c.text for c in chunks])
 
-        # ── 7. Store chunks ───────────────────────────────────────────────────
+        # ── 9. Store chunks ───────────────────────────────────────────────────
         store.delete_chunks(arxiv_id)
-        chunk_rows = [
-            (c.chunk_index, c.page_num, c.text, vectors[i])
+        store.insert_chunks(arxiv_id, [
+            (c.chunk_index, c.page_num, c.text, vectors[i], c.section_heading)
             for i, c in enumerate(chunks)
-        ]
-        store.insert_chunks(arxiv_id, chunk_rows)
+        ])
 
         try:
             store.ensure_vector_index()
         except Exception as ve:
             logger.warning("[INGEST] ensure_vector_index non-fatal: %s", ve)
 
-        # ── 8. Mark ready ─────────────────────────────────────────────────────
-        store.mark_ready(arxiv_id, extraction.total_pages, extraction.used_ocr)
-        logger.info("[INGEST] Complete: %s  chunks=%d", arxiv_id, len(chunks))
-
-        message = "Paper downloaded."
-        if extraction.failed_pages_note:
-            message += f"\n\n⚠️ Note: {extraction.failed_pages_note} Answers about content on those pages may be incomplete."
+        # ── 10. Mark ready ────────────────────────────────────────────────────
+        store.mark_ready(arxiv_id, pdf_total_pages, False)
+        logger.info("[INGEST] Complete: %s  chunks=%d  pages=%d", arxiv_id, len(chunks), pdf_total_pages)
 
         return {
             "status":   "ready",
-            "message":  message,
+            "message":  "Paper downloaded.",
             "arxiv_id": arxiv_id,
             "chunks":   len(chunks),
-            "used_ocr": extraction.used_ocr,
+            "used_ocr": False,
         }
 
     except Exception as e:
@@ -181,9 +149,9 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         return _fail(arxiv_id, f"An unexpected error occurred during ingestion: {error_msg}")
 
 
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _fail(arxiv_id: str, message: str) -> Dict[str, Any]:
     return {

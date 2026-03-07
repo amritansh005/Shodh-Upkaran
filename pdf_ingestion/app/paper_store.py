@@ -26,6 +26,20 @@ paper_chunks
     page_num        INTEGER
     text            TEXT
     embedding       vector(1024)   -- BAAI/bge-large-en-v1.5 is 1024-dim
+    section_heading TEXT           -- heading this chunk belongs to, or NULL
+    created_at      TIMESTAMPTZ
+
+paper_sections
+    id              BIGSERIAL PRIMARY KEY
+    arxiv_id        TEXT  (FK → papers)
+    section_index   INTEGER        -- 0-based order in document
+    heading_level   INTEGER        -- 0=preamble, 1=top, 2=subsection, 3=sub-sub
+    heading_text    TEXT           -- exact heading as it appears
+    parent_heading  TEXT           -- nearest parent heading text, or NULL
+    page_start      INTEGER        -- 1-based page where section begins
+    page_end        INTEGER        -- 1-based page where section ends (inclusive)
+    content_text    TEXT           -- full extracted text for this section
+    content_length  INTEGER        -- character count
     created_at      TIMESTAMPTZ
 """
 
@@ -93,19 +107,59 @@ class PaperStore:
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS paper_chunks (
-                        id          BIGSERIAL PRIMARY KEY,
-                        arxiv_id    TEXT NOT NULL REFERENCES papers(arxiv_id) ON DELETE CASCADE,
-                        chunk_index INTEGER NOT NULL,
-                        page_num    INTEGER,
-                        text        TEXT NOT NULL,
-                        embedding   vector(1024),
-                        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        id               BIGSERIAL PRIMARY KEY,
+                        arxiv_id         TEXT NOT NULL REFERENCES papers(arxiv_id) ON DELETE CASCADE,
+                        chunk_index      INTEGER NOT NULL,
+                        page_num         INTEGER,
+                        text             TEXT NOT NULL,
+                        embedding        vector(1024),
+                        section_heading  TEXT,
+                        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
+                """)
+
+                # Safe migration for existing databases
+                cur.execute("""
+                    ALTER TABLE paper_chunks
+                        ADD COLUMN IF NOT EXISTS section_heading TEXT;
                 """)
 
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_chunks_arxiv_id
                         ON paper_chunks(arxiv_id);
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_chunks_section_heading
+                        ON paper_chunks(arxiv_id, section_heading)
+                        WHERE section_heading IS NOT NULL;
+                """)
+
+                # ── paper_sections table ──────────────────────────────────────
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS paper_sections (
+                        id              BIGSERIAL PRIMARY KEY,
+                        arxiv_id        TEXT NOT NULL REFERENCES papers(arxiv_id) ON DELETE CASCADE,
+                        section_index   INTEGER NOT NULL,
+                        heading_level   INTEGER NOT NULL DEFAULT 1,
+                        heading_text    TEXT NOT NULL,
+                        parent_heading  TEXT,
+                        page_start      INTEGER,
+                        page_end        INTEGER,
+                        content_text    TEXT NOT NULL DEFAULT '',
+                        content_length  INTEGER NOT NULL DEFAULT 0,
+                        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    );
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sections_arxiv_id
+                        ON paper_sections(arxiv_id);
+                """)
+
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sections_order
+                        ON paper_sections(arxiv_id, section_index);
                 """)
 
             conn.commit()
@@ -236,7 +290,6 @@ class PaperStore:
     # Chunk CRUD
     # ------------------------------------------------------------------
 
-
     def chunk_count(self, arxiv_id: str) -> int:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -259,25 +312,27 @@ class PaperStore:
     def insert_chunks(
         self,
         arxiv_id: str,
-        chunks: List[Tuple[int, Optional[int], str, List[float]]],
+        chunks: List[Tuple],
     ) -> None:
         """
         Bulk insert chunks.
-        chunks: list of (chunk_index, page_num, text, embedding_vector)
+        chunks: list of (chunk_index, page_num, text, embedding_vector, section_heading)
+        section_heading may be None for chunks produced by the page-level fallback.
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(
                     cur,
                     """
-                    INSERT INTO paper_chunks (arxiv_id, chunk_index, page_num, text, embedding)
+                    INSERT INTO paper_chunks
+                        (arxiv_id, chunk_index, page_num, text, embedding, section_heading)
                     VALUES %s;
                     """,
                     [
-                        (arxiv_id, ci, pn, text, embedding)
-                        for ci, pn, text, embedding in chunks
+                        (arxiv_id, ci, pn, text, embedding, section_heading)
+                        for ci, pn, text, embedding, section_heading in chunks
                     ],
-                    template="(%s, %s, %s, %s, %s::vector)",
+                    template="(%s, %s, %s, %s, %s::vector, %s)",
                 )
             conn.commit()
 
@@ -285,41 +340,75 @@ class PaperStore:
         self,
         arxiv_id: str,
         query_embedding: List[float],
-        top_k: int = 6,
-    ) -> List[Tuple[int, str, float]]:
+        top_k: Optional[int] = 6,
+        section_heading: Optional[str] = None,
+    ) -> List[Tuple[int, str, float, Optional[str]]]:
         """
         Cosine similarity search scoped to one paper.
-        Returns list of (chunk_index, text, score).
+        Returns list of (chunk_index, text, score, section_heading).
+
+        If section_heading is provided, restricts search to chunks from
+        that section only (case-insensitive ILIKE match).
+
+        If top_k is None, returns ALL matching chunks with no LIMIT —
+        used when a section filter is active so every chunk from that
+        section is returned regardless of how many there are.
         """
         embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT chunk_index, text,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM paper_chunks
-                    WHERE arxiv_id = %s
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s;
-                """, (embedding_str, arxiv_id, embedding_str, top_k))
+                if section_heading and top_k is None:
+                    # Fetch ALL chunks from this section in document order — no LIMIT
+                    cur.execute("""
+                        SELECT chunk_index, text,
+                               1 - (embedding <=> %s::vector) AS score,
+                               section_heading
+                        FROM paper_chunks
+                        WHERE arxiv_id = %s
+                          AND section_heading ILIKE %s
+                        ORDER BY chunk_index ASC;
+                    """, (embedding_str, arxiv_id, f"%{section_heading}%"))
+                elif section_heading:
+                    # Section filter with top_k cap
+                    cur.execute("""
+                        SELECT chunk_index, text,
+                               1 - (embedding <=> %s::vector) AS score,
+                               section_heading
+                        FROM paper_chunks
+                        WHERE arxiv_id = %s
+                          AND section_heading ILIKE %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                    """, (embedding_str, arxiv_id, f"%{section_heading}%", embedding_str, top_k))
+                else:
+                    # No section filter — standard similarity search with top_k cap
+                    cur.execute("""
+                        SELECT chunk_index, text,
+                               1 - (embedding <=> %s::vector) AS score,
+                               section_heading
+                        FROM paper_chunks
+                        WHERE arxiv_id = %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s;
+                    """, (embedding_str, arxiv_id, embedding_str, top_k))
                 rows = cur.fetchall()
-                return [(r[0], r[1], float(r[2])) for r in rows]
+                return [(r[0], r[1], float(r[2]), r[3]) for r in rows]
 
     # ------------------------------------------------------------------
-    # NEW: Tail retrieval for references mode
+    # Tail retrieval for references mode
     # ------------------------------------------------------------------
 
     def get_tail_chunks(
         self,
         arxiv_id: str,
         n: int = 10,
-    ) -> List[Tuple[int, str, float]]:
+    ) -> List[Tuple[int, str, float, Optional[str]]]:
         """
         Fetch the last N chunks of the paper by chunk_index.
         Used for references/bibliography queries (usually at end of paper).
 
-        Returns list of (chunk_index, text, score=0.0),
+        Returns list of (chunk_index, text, score=0.0, section_heading),
         sorted in ascending document order.
         """
         n = max(0, int(n))
@@ -330,7 +419,7 @@ class PaperStore:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT chunk_index, text
+                    SELECT chunk_index, text, section_heading
                     FROM paper_chunks
                     WHERE arxiv_id = %s
                     ORDER BY chunk_index DESC
@@ -339,7 +428,140 @@ class PaperStore:
                     (arxiv_id, n),
                 )
                 rows = cur.fetchall()
-
-                # Reverse to return in correct document order
                 rows = list(reversed(rows))
-                return [(int(r[0]), r[1], 0.0) for r in rows]
+                return [(int(r[0]), r[1], 0.0, r[2]) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Section CRUD
+    # ------------------------------------------------------------------
+
+    def delete_sections(self, arxiv_id: str) -> None:
+        """Delete all sections for a paper (called before re-ingesting)."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM paper_sections WHERE arxiv_id = %s;",
+                    (arxiv_id,),
+                )
+            conn.commit()
+
+    def insert_sections(
+        self,
+        arxiv_id: str,
+        sections: list,
+    ) -> None:
+        """
+        Bulk insert all sections for a paper.
+        sections: List[PaperSection] from section_assembler.assemble_sections()
+        """
+        if not sections:
+            return
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO paper_sections
+                        (arxiv_id, section_index, heading_level, heading_text,
+                         parent_heading, page_start, page_end,
+                         content_text, content_length)
+                    VALUES %s;
+                    """,
+                    [
+                        (
+                            arxiv_id,
+                            s.section_index,
+                            s.heading_level,
+                            s.heading_text,
+                            s.parent_heading,
+                            s.page_start,
+                            s.page_end,
+                            s.content_text,
+                            s.content_length,
+                        )
+                        for s in sections
+                    ],
+                )
+            conn.commit()
+        logger.info("[PaperStore] Inserted %d sections for %s.", len(sections), arxiv_id)
+
+    def get_sections(self, arxiv_id: str) -> list:
+        """
+        Return all sections for a paper in document order.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT section_index, heading_level, heading_text,
+                           parent_heading, page_start, page_end,
+                           content_text, content_length
+                    FROM paper_sections
+                    WHERE arxiv_id = %s
+                    ORDER BY section_index ASC;
+                    """,
+                    (arxiv_id,),
+                )
+                rows = cur.fetchall()
+                return [
+                    {
+                        "section_index":  r[0],
+                        "heading_level":  r[1],
+                        "heading_text":   r[2],
+                        "parent_heading": r[3],
+                        "page_start":     r[4],
+                        "page_end":       r[5],
+                        "content_text":   r[6],
+                        "content_length": r[7],
+                    }
+                    for r in rows
+                ]
+
+    def section_count(self, arxiv_id: str) -> int:
+        """Return how many sections are stored for a paper."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM paper_sections WHERE arxiv_id = %s;",
+                    (arxiv_id,),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+
+    def get_section_by_heading(
+        self,
+        arxiv_id: str,
+        heading_query: str,
+    ) -> Optional[dict]:
+        """
+        Find a section by approximate heading match (case-insensitive ILIKE).
+        Returns the best matching section dict, or None.
+        """
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT section_index, heading_level, heading_text,
+                           parent_heading, page_start, page_end,
+                           content_text, content_length
+                    FROM paper_sections
+                    WHERE arxiv_id = %s
+                      AND heading_text ILIKE %s
+                    ORDER BY section_index ASC
+                    LIMIT 1;
+                    """,
+                    (arxiv_id, f"%{heading_query}%"),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                return {
+                    "section_index":  row[0],
+                    "heading_level":  row[1],
+                    "heading_text":   row[2],
+                    "parent_heading": row[3],
+                    "page_start":     row[4],
+                    "page_end":       row[5],
+                    "content_text":   row[6],
+                    "content_length": row[7],
+                }

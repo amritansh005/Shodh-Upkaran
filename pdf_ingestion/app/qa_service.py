@@ -2,19 +2,22 @@
 qa_service.py — RAG-based Q&A over ingested papers.
 
 Flow:
-    1. Ask GPT-4o to classify the question as structural / references / specific.
-    2. Embed question with BGE query instruction prefix.
-    3. Similarity search in pgvector scoped to the paper's arxiv_id.
-    4. (References mode) Also include tail chunks because references are usually at the end.
-    5. Build context from retrieved chunks (with a max character cap).
-    6. Call GPT-4o with context + question.
-    7. Return answer string.
+    1. Ask GPT-4o to classify the question into one of four labels:
+         outline    — wants the document structure/headings/sections list
+         structural — wants content from a broad section or overview
+         references — wants the bibliography/citations
+         specific   — wants a narrow fact or detail
+    2. outline questions are answered directly from the stored HeadingTree
+       (no embedding retrieval needed) — this is the "fast path".
+    3. For all other types: embed question → pgvector similarity search →
+       build context → call GPT-4o with context + question.
+    4. (references mode) Also append tail chunks (end of paper).
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 from pdf_ingestion.app.paper_store import PaperStore, STATUS_READY
 from pdf_ingestion.app.embedder import get_embedder
@@ -30,16 +33,30 @@ MAX_CONTEXT_CHARS = 12000
 FULL_DOC_TOP_K = 50
 FULL_DOC_MAX_CONTEXT_CHARS = 20000
 
+# --- Section-filtered config (all chunks from matched section, no top_k cap) ---
+# When a question targets a specific named section (e.g. "what does methodology say?"),
+# we fetch ALL chunks from that section and pass them ALL to GPT-4o in document order.
+# Cap raised to 80k chars (~20k tokens) — covers even the longest Results/Discussion
+# sections. GPT-4o supports 128k context so this is safely within limits.
+SECTION_MAX_CONTEXT_CHARS = 80000
+
 # --- References config (references/bibliography usually live at end of paper) ---
 REF_TOP_K = 80
 REF_MAX_CONTEXT_CHARS = 40000  # references lists are long — give them enough room
 REF_TAIL_CHUNKS = 30  # last 30 chunks covers ~12 pages, enough for any references section
 
-# Question type labels returned by GPT-4o classifier
-QuestionType = Literal["structural", "references", "specific"]
+# Question type labels returned by GPT-4o classifier.
+# "outline" is a dedicated label for "show me the document structure" intent,
+# allowing the LLM to recognise this regardless of the exact words used
+# ("sections", "headings", "chapters", "table of contents", "show me the outline",
+# "what sections does this paper have", etc.) — no keyword list needed.
+QuestionType = Literal["outline", "structural", "references", "specific"]
 
-# Lightweight hard overrides (guardrails) to reduce misrouting
-# NOTE: These do NOT attempt to enumerate paper headings; they only detect question intent.
+# Hard override only for references — this intent is unambiguous and benefits
+# from a fast, stable bypass of the LLM classifier.
+# Structural/outline routing is intentionally left to the LLM: keyword lists
+# are brittle and miss paraphrases like "walk me through the sections" or
+# "what topics does this paper cover?".
 _HARD_REFERENCES_KEYWORDS = (
     "references",
     "bibliography",
@@ -49,30 +66,31 @@ _HARD_REFERENCES_KEYWORDS = (
     "cited works",
 )
 
-_HARD_STRUCTURAL_KEYWORDS = (
-    "heading",
-    "headings",
-    "header",
-    "headers",
-    "outline",
-    "table of contents",
-    "toc",
-    "sections",
-    "structure",
-    "chapter",
-    "chapters",
-)
-
-# Keywords that specifically mean "list the headings/structure" —
-# for these we answer directly from the stored HeadingTree, no embeddings needed.
-_HEADING_QUERY_KEYWORDS = (
-    "heading",
-    "headings",
-    "header",
-    "headers",
-    "outline",
-    "table of contents",
-    "toc",
+# Generic section-name fragments used as a fallback when no HeadingTree is
+# available.  Dynamic matching against the paper's actual stored section
+# headings is always tried first (see _detect_section_filter).
+_GENERIC_SECTION_TRIGGER_MAP = (
+    # (question keyword,          section heading fragment to filter on)
+    ("abstract",                  "abstract"),
+    ("introduction",              "introduction"),
+    ("related work",              "related work"),
+    ("literature review",         "related work"),
+    ("background",                "background"),
+    ("methodology",               "methodology"),
+    ("method",                    "method"),
+    ("approach",                  "approach"),
+    ("experiment",                "experiment"),
+    ("evaluation",                "evaluation"),
+    ("results",                   "result"),
+    ("findings",                  "result"),
+    ("discussion",                "discussion"),
+    ("conclusion",                "conclusion"),
+    ("future work",               "future"),
+    ("limitation",                "limitation"),
+    ("dataset",                   "dataset"),
+    ("implementation",            "implementation"),
+    ("architecture",              "architecture"),
+    ("contribution",              "contribution"),
 )
 
 _HEADING_SYSTEM_PROMPT = """\
@@ -93,10 +111,17 @@ You are a router for a research-paper Q&A system.
 
 Classify the user's question into EXACTLY ONE label:
 
+outline:
+- asks what sections, headings, chapters, or topics the paper contains
+- asks for the paper's structure, table of contents, or outline
+- asks to list/show/enumerate the sections or headings
+- Examples: "what sections does this paper have?", "show me the headings",
+  "what are the different parts of this paper?", "give me the table of contents",
+  "what topics does this paper cover?", "walk me through the structure"
+
 structural:
-- asks for headings/sections/outline/table of contents/structure
-- asks for overview/summary/key takeaways/main points/contributions
-- asks to explain or summarize a SECTION or broad topic, e.g.:
+- asks for overview/summary/key takeaways/main points/contributions of the whole paper
+- asks to explain or summarize a SPECIFIC SECTION or broad topic, e.g.:
   applications, use cases, implications, limitations, discussion, future work,
   conclusion, results, findings, methodology, approach, datasets, experiments
 - asks for a brief description like "in 2–3 lines" about a broad part of the paper
@@ -108,7 +133,7 @@ specific:
 - asks for a single narrow fact/value/definition/equation/detail from a small passage
 
 Output rules:
-- Reply with ONLY one of these three words: structural, references, specific
+- Reply with ONLY one of these four words: outline, structural, references, specific
 - No punctuation. No extra words. No explanation.
 """
 
@@ -174,6 +199,73 @@ Rules:
 """
 
 
+def _detect_section_filter(question: str, stored_headings: Optional[List[str]] = None) -> Optional[str]:
+    """
+    Detect if a question targets a specific named section and return the
+    heading fragment to pass to search_chunks(section_heading=...).
+
+    Strategy (in order):
+    1. DYNAMIC: scan the paper's actual stored section headings for any
+       heading whose significant words all appear in the question.  This
+       handles any paper-specific heading — "Training Phase", "Dataset
+       Building", "Adversarial Attacks on NLP", etc. — without needing
+       them in a static list.
+    2. GENERIC FALLBACK: check the static _GENERIC_SECTION_TRIGGER_MAP
+       for common cross-paper section names (abstract, introduction, …).
+
+    Returns the best-matching heading text, or None if nothing matches.
+
+    Examples (dynamic, from stored headings):
+      question "Whats inside Training Phase?" + stored "2. Training Phase"
+        → returns "Training Phase"   (matched by significant words)
+      question "tell me about Dataset Building"
+        → returns "Dataset Building"
+
+    Examples (generic fallback):
+      "what does the methodology say?" → "method"
+      "summarise the results"          → "result"
+    """
+    import re
+
+    q_lower = question.lower()
+
+    # ── 1. Dynamic match against stored headings ─────────────────────────────
+    if stored_headings:
+        # Strip numbering/punctuation from each heading and extract significant words
+        # (length > 3 to skip roman numerals, "the", "and", etc.)
+        _strip_re = re.compile(r"^[IVXivx\d]+[.)]\s*|^[A-Za-z][.)]\s*")
+
+        best_match: Optional[str] = None
+        best_score = 0
+
+        for heading in stored_headings:
+            # Remove leading numbering (e.g. "2. ", "A. ", "IX. ")
+            clean = _strip_re.sub("", heading).strip()
+            words = [w for w in re.findall(r"[a-z]+", clean.lower()) if len(w) > 3]
+            if not words:
+                continue
+            # Score = fraction of significant words found in the question
+            matched = sum(1 for w in words if w in q_lower)
+            score = matched / len(words)
+            if score > best_score and matched >= max(1, len(words) // 2):
+                best_score = score
+                best_match = clean  # use the clean heading (without numbering)
+
+        if best_match and best_score >= 0.5:
+            logger.debug(
+                "[QA] Dynamic section filter: %r → %r (score=%.2f)",
+                question[:60], best_match, best_score,
+            )
+            return best_match
+
+    # ── 2. Generic fallback ──────────────────────────────────────────────────
+    for question_kw, section_fragment in _GENERIC_SECTION_TRIGGER_MAP:
+        if question_kw in q_lower:
+            return section_fragment
+
+    return None
+
+
 class QAService:
     def __init__(self, store: PaperStore, llm_client) -> None:
         self._store = store
@@ -181,38 +273,40 @@ class QAService:
 
     def _hard_route(self, question: str) -> QuestionType | None:
         """
-        Cheap, deterministic routing for obvious cases.
-        Returns a QuestionType if confidently matched, else None.
+        Cheap, deterministic bypass for references questions only.
+        These keywords are unambiguous and benefit from skipping the LLM call.
+
+        Structural and outline routing is intentionally NOT done here — those
+        intents have too many paraphrases to be caught reliably by keywords,
+        so they are left entirely to the LLM classifier.
         """
         q = (question or "").strip().lower()
         if not q:
             return None
 
-        # References overrides structural if both appear.
         if any(k in q for k in _HARD_REFERENCES_KEYWORDS):
             return "references"
-
-        if any(k in q for k in _HARD_STRUCTURAL_KEYWORDS):
-            return "structural"
 
         return None
 
     def _classify_question(self, question: str) -> QuestionType:
         """
         Ask GPT-4o to classify the question as one of:
-          'structural' | 'references' | 'specific'
+          'outline' | 'structural' | 'references' | 'specific'
 
-        Falls back to 'specific' if the LLM is unavailable or returns
-        an unexpected label, so retrieval always continues.
+        'outline' means the user wants the document structure listed from the
+        stored HeadingTree — regardless of whether they said "headings",
+        "sections", "chapters", "table of contents", "topics", etc.
+
+        Falls back to 'specific' if the LLM is unavailable or returns an
+        unexpected label, so retrieval always continues.
         """
-
-        # Hard routing guardrails first (fast + stable)
+        # Hard bypass for references (fast + unambiguous)
         hard = self._hard_route(question)
         if hard is not None:
             logger.info("[QA] Hard-routed question as '%s': %r", hard, question)
             return hard
 
-        # If LLM isn't available, keep behavior stable and proceed with specific mode.
         if not self._llm.enabled():
             logger.warning("[QA] LLM not available for classification, defaulting to 'specific'")
             return "specific"
@@ -226,10 +320,10 @@ class QAService:
                 temperature=0.0,
             )
 
-            # Robust normalization: strip whitespace + common punctuation
+            # Robust normalisation: strip whitespace + common punctuation
             label = (raw or "").strip().lower().strip(" \t\r\n.:-\"'`")
 
-            if label in ("structural", "references", "specific"):
+            if label in ("outline", "structural", "references", "specific"):
                 logger.info("[QA] GPT-4o classified question as '%s': %r", label, question)
                 return label  # type: ignore[return-value]
 
@@ -260,24 +354,30 @@ class QAService:
                 return "The paper is still being processed. Please try again in a moment."
             return "This paper hasn't been ingested yet. Open it first with `open <n>`."
 
-        # ── Fast path: heading queries answered from stored HeadingTree ───────
-        # At ingest time, GPT-4o vision read every page as an image and
-        # extracted the heading structure. For queries asking "what are the
-        # headings / outline / table of contents", we skip embedding retrieval
-        # entirely and answer directly from that stored data.
-        _q = question.lower()
-        if any(k in _q for k in _HEADING_QUERY_KEYWORDS):
+        # ── Classify the question (single LLM call decides all routing) ───────
+        question_type = self._classify_question(question)
+
+        # ── Fast path: outline questions answered from stored HeadingTree ─────
+        # The classifier emits "outline" for any question whose intent is
+        # "show me the document structure" — regardless of exact wording.
+        # This bypasses embedding retrieval entirely and gives a consistent
+        # answer sourced from the vision-extracted heading tree.
+        if question_type == "outline":
             stored_json = self._store.get_headings(arxiv_id)
             if stored_json:
                 tree = HeadingTree.from_json(stored_json)
                 if not tree.is_empty():
                     logger.info(
-                        "[QA] Heading fast-path: %d headings stored for %s",
+                        "[QA] Outline fast-path: %d headings stored for %s",
                         len(tree.headings), arxiv_id,
                     )
-                    heading_outline = tree.format_for_llm()
+                    # format_for_display: levels 1+2 only — clean user-facing TOC.
+                    # format_for_llm: all levels — gives the LLM full context to
+                    # answer follow-up questions accurately.
+                    display_outline = tree.format_for_display()
+                    full_outline    = tree.format_for_llm()
                     if not self._llm.enabled():
-                        return heading_outline
+                        return display_outline
                     try:
                         answer = self._llm.chat(
                             messages=[
@@ -286,20 +386,20 @@ class QAService:
                                     "role": "user",
                                     "content": (
                                         (f"Paper: {paper_title}\n\n" if paper_title else "")
-                                        + f"Heading outline:\n{heading_outline}\n\n"
+                                        + f"Heading outline:\n{full_outline}\n\n"
                                         + f"Question: {question}"
                                     ),
                                 },
                             ],
                             temperature=0.0,
                         )
-                        return answer.strip() if answer else heading_outline
+                        return answer.strip() if answer else display_outline
                     except Exception as _e:
-                        logger.error("[QA] Heading fast-path LLM call failed: %s", _e)
-                        return heading_outline
-
-        # Choose retrieval strategy based on GPT-4o question classification
-        question_type = self._classify_question(question)
+                        logger.error("[QA] Outline fast-path LLM call failed: %s", _e)
+                        return display_outline
+            # HeadingTree unavailable — fall through to RAG with structural mode
+            logger.info("[QA] Outline fast-path: no HeadingTree stored, falling back to RAG")
+            question_type = "structural"
         is_references = question_type == "references"
         is_structural = question_type in ("structural", "references")
 
@@ -312,9 +412,39 @@ class QAService:
             max_chars = FULL_DOC_MAX_CONTEXT_CHARS if is_structural else MAX_CONTEXT_CHARS
             system_prompt = _STRUCTURAL_SYSTEM_PROMPT if is_structural else _QA_SYSTEM_PROMPT
 
+        # Detect if question targets a specific named section.
+        # When detected: fetch ALL chunks from that section (top_k=None) in
+        # document order and pass the full section to GPT-4o.
+        #
+        # Runs for BOTH "specific" AND "structural" questions — e.g.
+        # "summarize the methodology section" is classified as structural but
+        # should still deliver all methodology chunks in order, not a scattered
+        # top-50 similarity search.
+        section_filter = None
+        stored_heading_texts: Optional[List[str]] = None
+        if not is_references:
+            try:
+                _hj = self._store.get_headings(arxiv_id)
+                if _hj:
+                    _ht = HeadingTree.from_json(_hj)
+                    stored_heading_texts = [h.text for h in _ht.headings]
+            except Exception:
+                pass
+            section_filter = _detect_section_filter(question, stored_heading_texts)
+            if section_filter:
+                top_k     = None                    # fetch EVERY chunk from this section
+                max_chars = SECTION_MAX_CONTEXT_CHARS
+                # Use specific QA prompt — structural prompt's heading-list rules
+                # conflict with full section dumps.
+                system_prompt = _QA_SYSTEM_PROMPT
+                logger.info(
+                    "[QA] Section filter detected: %r → %r  (top_k=None, max_chars=%d)",
+                    question, section_filter, max_chars,
+                )
+
         logger.info(
-            "[QA] arxiv_id=%s structural=%s references=%s top_k=%d max_chars=%d question=%r",
-            arxiv_id, is_structural, is_references, top_k, max_chars, question,
+            "[QA] arxiv_id=%s structural=%s references=%s section_filter=%r top_k=%s max_chars=%d question=%r",
+            arxiv_id, is_structural, is_references, section_filter, top_k, max_chars, question,
         )
 
         # Embed the question
@@ -324,9 +454,9 @@ class QAService:
             logger.error("[QA] embed_query failed: %s", e)
             return "Sorry, I had trouble processing your question. Please try again."
 
-        # Retrieve top-k chunks
+        # Retrieve chunks — ALL from the section when filter active, top_k otherwise
         try:
-            hits = self._store.search_chunks(arxiv_id, query_vec, top_k=top_k)
+            hits = self._store.search_chunks(arxiv_id, query_vec, top_k=top_k, section_heading=section_filter)
         except Exception as e:
             logger.error("[QA] search_chunks failed: %s", e)
             return "Sorry, I couldn't search the paper content. Please try again."
@@ -334,7 +464,7 @@ class QAService:
         if not hits:
             return "I have no content stored for this paper. Try re-opening it with `open <n>`."
 
-        # (References mode) Always include the last N chunks, because references are usually at the end.
+        # (References mode) Always include the last N chunks
         if is_references:
             tail_hits = []
             if hasattr(self._store, "get_tail_chunks"):
@@ -345,34 +475,30 @@ class QAService:
                     tail_hits = []
 
             if tail_hits:
-                # Merge by chunk_index, deduplicate
-                merged = {ci: (ci, text, score) for ci, text, score in hits}
-                for ci, text, score in tail_hits:
-                    merged.setdefault(ci, (ci, text, score))
-                # Sort tail chunks FIRST (ascending document order), then similarity
-                # hits from the rest of the paper after. This guarantees references
-                # at the end of the paper are never cut off by the MAX_CONTEXT_CHARS
-                # cap — they go into context before chunks from the middle of the paper.
-                tail_indices = {ci for ci, _, _ in tail_hits}
+                merged = {ci: (ci, text, score, sec) for ci, text, score, sec in hits}
+                for ci, text, score, sec in tail_hits:
+                    merged.setdefault(ci, (ci, text, score, sec))
+                tail_indices = {ci for ci, _, _, _ in tail_hits}
                 tail_part = sorted(
                     [v for v in merged.values() if v[0] in tail_indices],
-                    key=lambda h: h[0],   # ascending document order within tail
+                    key=lambda h: h[0],
                 )
                 other_part = sorted(
                     [v for v in merged.values() if v[0] not in tail_indices],
-                    key=lambda h: -h[2],  # descending similarity score
+                    key=lambda h: -h[2],
                 )
                 hits = tail_part + other_part
 
-        # For structural questions: sort chunks by chunk_index (document order)
-        # so headings and sections appear in reading order, not similarity order.
-        if is_structural:
-            hits = sorted(hits, key=lambda h: h[0])  # h[0] is chunk_index
+        # Sort by chunk_index (document order) for structural questions OR
+        # when a section filter is active — guarantees the LLM sees the section
+        # in reading order, not ranked by similarity score.
+        if is_structural or section_filter:
+            hits = sorted(hits, key=lambda h: h[0])
 
         # Build context (cap at max_chars)
         context_parts: List[str] = []
         total = 0
-        for _ci, text, _score in hits:
+        for _ci, text, _score, _sec in hits:
             if total + len(text) > max_chars:
                 remaining = max_chars - total
                 if remaining > 200:
