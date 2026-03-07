@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -37,43 +38,57 @@ from pdf_ingestion.app.section_assembler import SectionAssembly, PaperSection
 os.environ.setdefault("TORCH_DEVICE", "cuda")
 
 _converter = None   # PdfConverter singleton
+_converter_lock = threading.Lock()
 
 
 def _get_converter():
     """
     Lazy-load the Marker PdfConverter and keep it in memory.
+
+    Thread-safe:
+    - only one thread is allowed to build the converter
+    - all other threads will wait and reuse the same singleton
+
     Models are downloaded on first run (~1-2 GB) then cached locally.
     Subsequent calls reuse the already-loaded models.
     """
     global _converter
+
     if _converter is not None:
         return _converter
 
-    try:
-        import torch
-        from marker.converters.pdf import PdfConverter
-        from marker.models import create_model_dict
-        from marker.config.parser import ConfigParser
+    with _converter_lock:
+        # Double-check inside the lock so only one thread initializes it.
+        if _converter is not None:
+            return _converter
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cpu":
-            logger.warning("[MARKER] CUDA not available — running on CPU (will be slow)")
-        else:
-            logger.info("[MARKER] Using GPU: %s", torch.cuda.get_device_name(0))
+        try:
+            import torch
+            from marker.converters.pdf import PdfConverter
+            from marker.models import create_model_dict
+            from marker.config.parser import ConfigParser
 
-        config_parser = ConfigParser({"output_format": "markdown"})
-        _converter = PdfConverter(
-            config=config_parser.generate_config_dict(),
-            artifact_dict=create_model_dict(),
-            processor_list=config_parser.get_processors(),
-            renderer=config_parser.get_renderer(),
-        )
-        logger.info("[MARKER] Models loaded on %s", device.upper())
-        return _converter
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cpu":
+                logger.warning("[MARKER] CUDA not available — running on CPU (will be slow)")
+            else:
+                logger.info("[MARKER] Using GPU: %s", torch.cuda.get_device_name(0))
 
-    except Exception as e:
-        logger.error("[MARKER] Failed to load models: %s", e)
-        raise
+            config_parser = ConfigParser({"output_format": "markdown"})
+            converter = PdfConverter(
+                config=config_parser.generate_config_dict(),
+                artifact_dict=create_model_dict(),
+                processor_list=config_parser.get_processors(),
+                renderer=config_parser.get_renderer(),
+            )
+
+            _converter = converter
+            logger.info("[MARKER] Models loaded on %s", device.upper())
+            return _converter
+
+        except Exception as e:
+            logger.exception("[MARKER] Failed to load models: %s", e)
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -92,46 +107,50 @@ def _parse_markdown_to_sections(
     Page numbers are approximated from line position in the Markdown.
     Marker's page separator '---' is used to track page boundaries.
     """
-    sections:    List[PaperSection] = []
-    headings:    List[Heading]      = []
-    level_stack: Dict[int, str]     = {}
+    sections: List[PaperSection] = []
+    headings: List[Heading] = []
+    level_stack: Dict[int, str] = {}
 
-    md_lines       = markdown.splitlines()
-    total_lines    = max(len(md_lines), 1)
+    md_lines = markdown.splitlines()
+    total_lines = max(len(md_lines), 1)
     lines_per_page = max(1, total_lines // max(total_pages, 1))
 
-    current_heading_text:  Optional[str] = None
-    current_heading_level: int           = 1
-    current_page_start:    int           = 1
-    current_body:          List[str]     = []
-    section_index:         int           = 0
-    current_page:          int           = 1
+    current_heading_text: Optional[str] = None
+    current_heading_level: int = 1
+    current_page_start: int = 1
+    current_body: List[str] = []
+    section_index: int = 0
+    current_page: int = 1
 
     def _flush() -> None:
         nonlocal section_index
         if current_heading_text is None:
             return
+
         content = "\n".join(current_body).strip()
-        parent  = None
+        parent = None
         for lvl in range(current_heading_level - 1, 0, -1):
             if lvl in level_stack:
                 parent = level_stack[lvl]
                 break
-        sections.append(PaperSection(
-            section_index  = section_index,
-            heading_level  = current_heading_level,
-            heading_text   = current_heading_text,
-            parent_heading = parent,
-            page_start     = current_page_start,
-            page_end       = current_page,
-            content_text   = content,
-            content_length = len(content),
-        ))
+
+        sections.append(
+            PaperSection(
+                section_index=section_index,
+                heading_level=current_heading_level,
+                heading_text=current_heading_text,
+                parent_heading=parent,
+                page_start=current_page_start,
+                page_end=current_page,
+                content_text=content,
+                content_length=len(content),
+            )
+        )
         section_index += 1
 
-    preamble_lines:      List[str] = []
-    first_heading_found: bool      = False
-    preamble_page_start: int       = 1
+    preamble_lines: List[str] = []
+    first_heading_found: bool = False
+    preamble_page_start: int = 1
 
     for line_idx, raw_line in enumerate(md_lines):
         current_page = max(1, line_idx // lines_per_page + 1)
@@ -148,30 +167,32 @@ def _parse_markdown_to_sections(
                 # Flush preamble (title / author / abstract area before first heading)
                 preamble_text = "\n".join(preamble_lines).strip()
                 if preamble_text:
-                    sections.append(PaperSection(
-                        section_index  = section_index,
-                        heading_level  = 0,
-                        heading_text   = "",
-                        parent_heading = None,
-                        page_start     = preamble_page_start,
-                        page_end       = current_page,
-                        content_text   = preamble_text,
-                        content_length = len(preamble_text),
-                    ))
+                    sections.append(
+                        PaperSection(
+                            section_index=section_index,
+                            heading_level=0,
+                            heading_text="",
+                            parent_heading=None,
+                            page_start=preamble_page_start,
+                            page_end=current_page,
+                            content_text=preamble_text,
+                            content_length=len(preamble_text),
+                        )
+                    )
                     section_index += 1
                 first_heading_found = True
             else:
                 _flush()
 
             level = len(heading_match.group(1))
-            text  = heading_match.group(2).strip()
+            text = heading_match.group(2).strip()
             # Strip bold/italic markers that sometimes appear inside headings
-            text  = re.sub(r"\*{1,2}(.+?)\*{1,2}", r"\1", text).strip()
+            text = re.sub(r"\*{1,2}(.+?)\*{1,2}", r"\1", text).strip()
 
-            current_heading_text  = text
+            current_heading_text = text
             current_heading_level = level
-            current_page_start    = current_page
-            current_body          = []
+            current_page_start = current_page
+            current_body = []
 
             level_stack[level] = text
             for deeper in list(level_stack.keys()):
@@ -224,6 +245,7 @@ def extract_sections_via_vision(
     total_pages = 0
     try:
         import fitz
+
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         total_pages = len(doc)
         doc.close()

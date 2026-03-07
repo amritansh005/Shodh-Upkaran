@@ -1,5 +1,19 @@
 """
-ingest_pipeline.py — Full pipeline: download → Marker extract → chunk → embed → store.
+ingest_pipeline.py — Full pipeline: download → extract → chunk → embed → store.
+
+Extraction strategy (in order, first success wins):
+  1. PyMuPDF + GPT-4o Vision heading detection (fast, ~10-20s)
+       - PyMuPDF extracts flat page text in ~1-3s
+       - GPT-4o Vision detects top-level headings via parallel image batches
+       - Page text is sliced by heading page ranges → PaperSection objects
+       - Works for any born-digital PDF (the vast majority of arXiv papers)
+       - Falls back to step 2 if: no embedded text (scanned) OR GPT-4o returns
+         no headings OR LLM client is unavailable
+
+  2. Marker GPU extraction (slow, ~10+ min, GPU required)
+       - Full OCR + layout model pipeline
+       - Handles scanned PDFs and complex layouts
+       - Used only when step 1 cannot produce structured sections
 """
 
 from __future__ import annotations
@@ -13,7 +27,6 @@ from pdf_ingestion.app.pdf_downloader import download_pdf
 from pdf_ingestion.app.chunker import chunk_sections
 from pdf_ingestion.app.embedder import get_embedder
 from pdf_ingestion.app.paper_store import PaperStore, STATUS_READY, STATUS_PROCESSING
-from pdf_ingestion.app.vision_extractor import extract_sections_via_vision
 
 logger = logging.getLogger(__name__)
 
@@ -74,48 +87,133 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         store.save_pdf_bytes(arxiv_id, dl.pdf_bytes)
         logger.info("[INGEST] Downloaded: %s  bytes=%d", arxiv_id, len(dl.pdf_bytes))
 
-        # ── 4. Marker extraction ──────────────────────────────────────────────
-        logger.info("[INGEST] Starting Marker extraction: %s", arxiv_id)
+        # ── 4. Build LLM client from settings ────────────────────────────────
+        llm_client = _build_llm_client(settings)
 
         loop = asyncio.get_running_loop()
 
-        assembly, heading_tree, pdf_total_pages = await loop.run_in_executor(
-            _EXECUTOR,
-            lambda: extract_sections_via_vision(pdf_bytes=dl.pdf_bytes, settings=settings),
-        )
+        assembly        = None
+        heading_tree    = None
+        pdf_total_pages = 0
+        used_ocr        = False
+        extraction_method = "unknown"
 
-        # ── 5. Check extraction result ────────────────────────────────────────
+        # ── 5a. PRIMARY: PyMuPDF + GPT-4o Vision heading extraction ──────────
+        if llm_client and llm_client.enabled():
+            logger.info("[INGEST] Trying Vision heading extraction: %s", arxiv_id)
+            try:
+                from pdf_ingestion.app.vision_heading_extractor import (
+                    extract_sections_via_vision_headings,
+                )
+                assembly, heading_tree, pdf_total_pages = await loop.run_in_executor(
+                    _EXECUTOR,
+                    lambda: extract_sections_via_vision_headings(
+                        pdf_bytes  = dl.pdf_bytes,
+                        llm_client = llm_client,
+                        settings   = settings,
+                    ),
+                )
+
+                if assembly and not assembly.is_empty():
+                    extraction_method = "vision_heading"
+                    logger.info(
+                        "[INGEST] Vision heading extraction succeeded: %s  sections=%d",
+                        arxiv_id, len(assembly.sections),
+                    )
+                else:
+                    reason = getattr(assembly, "error", None) or "No sections produced."
+                    logger.warning(
+                        "[INGEST] Vision heading extraction failed for %s: %s "
+                        "— falling back to Marker",
+                        arxiv_id, reason,
+                    )
+                    assembly = None
+                    heading_tree = None
+                    pdf_total_pages = 0
+
+            except Exception as e:
+                logger.error(
+                    "[INGEST] Vision heading extraction exception for %s: %s "
+                    "— falling back to Marker",
+                    arxiv_id, e, exc_info=True,
+                )
+                assembly = None
+                heading_tree = None
+                pdf_total_pages = 0
+        else:
+            logger.info(
+                "[INGEST] LLM client not available — skipping Vision heading extraction, "
+                "going straight to Marker: %s",
+                arxiv_id,
+            )
+
+        # ── 5b. FALLBACK: Marker GPU extraction ───────────────────────────────
         if assembly is None or assembly.is_empty():
-            reason = getattr(assembly, "error", None) or "Marker returned no sections."
-            logger.error("[INGEST] Extraction failed: %s  reason=%s", arxiv_id, reason)
+            logger.info("[INGEST] Starting Marker extraction: %s", arxiv_id)
+            try:
+                from pdf_ingestion.app.vision_extractor import extract_sections_via_vision
+
+                assembly, heading_tree, pdf_total_pages = await loop.run_in_executor(
+                    _EXECUTOR,
+                    lambda: extract_sections_via_vision(
+                        pdf_bytes = dl.pdf_bytes,
+                        settings  = settings,
+                    ),
+                )
+                extraction_method = "marker"
+                used_ocr = True
+            except Exception as e:
+                error_msg = f"Marker extraction exception: {e}"
+                logger.error("[INGEST] %s for %s", error_msg, arxiv_id, exc_info=True)
+                store.mark_failed(arxiv_id, error_msg)
+                return _fail(arxiv_id, error_msg)
+
+        # ── 6. Validate extraction result ─────────────────────────────────────
+        if assembly is None or assembly.is_empty():
+            reason = getattr(assembly, "error", None) or "All extraction methods returned no sections."
+            logger.error(
+                "[INGEST] All extraction methods failed: %s  method=%s  reason=%s",
+                arxiv_id, extraction_method, reason,
+            )
             store.mark_failed(arxiv_id, reason)
             return _fail(arxiv_id, reason)
 
-        # ── 6. Store headings + sections ──────────────────────────────────────
-        if not heading_tree.is_empty():
+        logger.info(
+            "[INGEST] Extraction complete: %s  method=%s  sections=%d  pages=%d",
+            arxiv_id, extraction_method, len(assembly.sections), pdf_total_pages,
+        )
+
+        # ── 7. Store headings + sections ──────────────────────────────────────
+        if heading_tree and not heading_tree.is_empty():
             store.save_headings(arxiv_id, heading_tree.to_json())
-            logger.info("[INGEST] Headings stored: %s  count=%d", arxiv_id, len(heading_tree.headings))
+            logger.info(
+                "[INGEST] Headings stored: %s  count=%d",
+                arxiv_id, len(heading_tree.headings),
+            )
 
         store.delete_sections(arxiv_id)
         store.insert_sections(arxiv_id, assembly.sections)
-        logger.info("[INGEST] Sections stored: %s  count=%d", arxiv_id, len(assembly.sections))
+        logger.info(
+            "[INGEST] Sections stored: %s  count=%d",
+            arxiv_id, len(assembly.sections),
+        )
 
-        # ── 7. Chunk ──────────────────────────────────────────────────────────
+        # ── 8. Chunk ──────────────────────────────────────────────────────────
         chunks = chunk_sections(assembly.sections)
 
         if not chunks:
-            msg = "Marker extracted sections but produced no text chunks."
+            msg = "Extraction produced sections but chunker returned no text chunks."
             store.mark_failed(arxiv_id, msg)
             return _fail(arxiv_id, msg)
 
         logger.info("[INGEST] Chunked: %s  chunks=%d", arxiv_id, len(chunks))
 
-        # ── 8. Embed ──────────────────────────────────────────────────────────
+        # ── 9. Embed ──────────────────────────────────────────────────────────
         logger.info("[INGEST] Embedding: %s", arxiv_id)
         embedder = get_embedder()
         vectors  = embedder.embed_documents([c.text for c in chunks])
 
-        # ── 9. Store chunks ───────────────────────────────────────────────────
+        # ── 10. Store chunks ──────────────────────────────────────────────────
         store.delete_chunks(arxiv_id)
         store.insert_chunks(arxiv_id, [
             (c.chunk_index, c.page_num, c.text, vectors[i], c.section_heading)
@@ -127,16 +225,19 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         except Exception as ve:
             logger.warning("[INGEST] ensure_vector_index non-fatal: %s", ve)
 
-        # ── 10. Mark ready ────────────────────────────────────────────────────
-        store.mark_ready(arxiv_id, pdf_total_pages, False)
-        logger.info("[INGEST] Complete: %s  chunks=%d  pages=%d", arxiv_id, len(chunks), pdf_total_pages)
+        # ── 11. Mark ready ────────────────────────────────────────────────────
+        store.mark_ready(arxiv_id, pdf_total_pages, used_ocr)
+        logger.info(
+            "[INGEST] Complete: %s  method=%s  chunks=%d  pages=%d",
+            arxiv_id, extraction_method, len(chunks), pdf_total_pages,
+        )
 
         return {
             "status":   "ready",
             "message":  "Paper downloaded.",
             "arxiv_id": arxiv_id,
             "chunks":   len(chunks),
-            "used_ocr": False,
+            "used_ocr": used_ocr,
         }
 
     except Exception as e:
@@ -152,6 +253,26 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _build_llm_client(settings):
+    """
+    Build an LLMClient from ingest settings (sourced from app.state.settings in main.py).
+    Returns None if settings are unavailable or any credential is missing.
+    """
+    if settings is None:
+        return None
+    try:
+        from pdf_ingestion.app.llm_client import LLMClient
+        return LLMClient(
+            endpoint    = getattr(settings, "azure_openai_endpoint",    "") or "",
+            api_key     = getattr(settings, "azure_openai_api_key",     "") or "",
+            api_version = getattr(settings, "azure_openai_api_version", "") or "",
+            deployment  = getattr(settings, "azure_openai_deployment",  "") or "",
+        )
+    except Exception as e:
+        logger.warning("[INGEST] Could not build LLM client from settings: %s", e)
+        return None
+
 
 def _fail(arxiv_id: str, message: str) -> Dict[str, Any]:
     return {

@@ -143,6 +143,10 @@ paper and a question about it.
 
 Rules:
 - Answer ONLY from the provided excerpts. Do not use outside knowledge.
+- The excerpts are tagged with a section name (e.g. "Abstract", "Introduction").
+  Some excerpts may contain a small amount of text from an adjacent section due
+  to shared page boundaries — ignore any content that is clearly not relevant
+  to the question or the tagged section.
 - If the answer is not in the excerpts, say exactly: \
   "I couldn't find that in the paper. Try asking something else."
 - Be concise and factual.
