@@ -106,14 +106,50 @@ not the next one.
 # Page rendering (PyMuPDF → PNG bytes)
 # ---------------------------------------------------------------------------
 
-def _render_page_as_png(doc, page_idx: int, dpi: int = IMAGE_DPI) -> Optional[bytes]:
-    """Render a single PDF page to PNG bytes using PyMuPDF."""
+def _render_page_as_png(doc, page_idx: int, dpi: int = IMAGE_DPI, page_label: Optional[int] = None) -> Optional[bytes]:
+    """Render a single PDF page to PNG bytes using PyMuPDF.
+
+    If page_label is given, burns a visible "Page N" label into the top-left
+    corner of the rendered image. This gives the vision model an unambiguous
+    page number anchor so it can correctly assign headings that appear at the
+    bottom of a page to THAT page rather than the next.
+    """
     try:
         import fitz
         page = doc[page_idx]
         zoom = dpi / 72.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
+
+        if page_label is not None:
+            # Draw a white rounded rectangle + bold black text label in top-left.
+            # We use PIL if available (better text rendering); fall back to fitz annot.
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                import io as _io
+                img = Image.open(_io.BytesIO(pix.tobytes("png")))
+                draw = ImageDraw.Draw(img)
+                label = f" Page {page_label} "
+                # Try to get a reasonable font size (≈2.5% of image height)
+                font_size = max(14, int(img.height * 0.025))
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+                except Exception:
+                    font = ImageFont.load_default()
+                # Measure text
+                bbox = draw.textbbox((0, 0), label, font=font)
+                tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+                pad = 4
+                # White background rectangle
+                draw.rectangle([0, 0, tw + pad * 2, th + pad * 2], fill="white", outline="black")
+                draw.text((pad, pad), label, fill="black", font=font)
+                buf = _io.BytesIO()
+                img.save(buf, format="PNG")
+                return buf.getvalue()
+            except ImportError:
+                # PIL not available — write label as a fitz annotation (best-effort)
+                pass  # fall through to plain PNG
+
         return pix.tobytes("png")
     except Exception as e:
         logger.warning("[VISION_HEADING] Page %d render failed: %s", page_idx + 1, e)
@@ -158,7 +194,7 @@ def _call_vision_batch(
 
     pages_added = 0
     for idx, pnum in zip(page_indices, page_numbers):
-        png = _render_page_as_png(doc, idx)
+        png = _render_page_as_png(doc, idx, page_label=pnum)
         if png is None:
             continue
         content.append({
@@ -287,6 +323,202 @@ def _merge_batch_results(
             section["page_end"] = merged[i + 1]["page_start"]
         else:
             section["page_end"] = total_pages
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# PyMuPDF-based heading page anchoring (post-vision correction)
+# ---------------------------------------------------------------------------
+
+def _anchor_headings_with_pymupdf(
+    merged: List[Dict[str, Any]],
+    doc,
+    total_pages: int,
+    search_window: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Use PyMuPDF font-aware span search to pin each heading to the correct page.
+
+    WHY NAIVE TEXT SEARCH FAILS
+    ----------------------------
+    page.search_for("Introduction") matches every occurrence of the word — section
+    headings AND inline mentions ("as described in the Introduction..."). To find
+    only the real heading we use four layered signals:
+
+      1. SEARCH WINDOW (primary guard against cross-section contamination)
+         Each heading is only searched in [vision_page - search_window, vision_page + 1].
+         Because vision's estimate is already in the right neighbourhood (±1-2 pages),
+         a heading on page 33 will never accidentally match a mention of "Methodology"
+         in the Introduction on page 3 — those pages are outside the window entirely.
+
+      2. SECTION-NUMBER PREFIX (most discriminative signal)
+         If the heading carries a Roman/Arabic prefix ("XI. Conclusion", "3. Methodology"),
+         we search for the FULL prefixed string first. Prefixes virtually never appear
+         in body-text mentions, so a match is definitively the real heading.
+         Only when the prefix search fails do we fall through to font-size heuristics.
+
+      3. FONT SIZE >= BODY BASELINE (rejects body-text mentions in same window)
+         We compute the modal (most-frequent) font size on the page as the body-text
+         baseline. A span must be >= 95% of that size to qualify. Inline mentions of
+         heading words share the body font; real headings are the same size or larger.
+
+      4. RUNNING-HEADER / FOOTER EXCLUSION (rejects page-header repetitions)
+         Running headers that repeat the section name sit at the very top or bottom
+         of the page (y-position < 8% or > 92% of page height). We skip those zones
+         so "Introduction" printed as a chapter header on pages 2-5 does not steal
+         page 1's heading assignment.
+
+      5. STANDALONE LINE (rejects mid-sentence occurrences)
+         A real heading occupies its own line. We require the total text in the matched
+         line to be no more than 20 characters longer than the heading itself, which
+         rejects spans that appear in the middle of a long sentence.
+
+    Algorithm
+    ---------
+    For each section heading (in document order):
+      1. Narrow the search to [vision_page - search_window, vision_page + 1].
+      2. On each page in that window call _find_heading_span() which applies signals
+         2-5 in order, returning True on the first qualifying match.
+      3. The first page in the window with a qualifying match becomes page_start.
+      4. No match → keep vision's page_start (safe fallback, never makes things worse).
+    After all corrections: re-sort and rebuild page_end values.
+    """
+    from collections import Counter
+
+    def _norm(s: str) -> str:
+        s = _expand_ligatures(s.lower())
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _strip_prefix(h: str) -> str:
+        return re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", h.strip()).strip()
+
+    def _has_prefix(h: str) -> bool:
+        return bool(re.match(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", h.strip()))
+
+    def _modal_font_size(page_dict: dict) -> float:
+        """Modal font size = body-text baseline for this page."""
+        sizes: List[float] = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("text", "").strip():
+                        sizes.append(round(span.get("size", 0), 1))
+        if not sizes:
+            return 10.0
+        return Counter(sizes).most_common(1)[0][0]
+
+    def _in_header_footer_zone(line: dict, page_height: float) -> bool:
+        """True if line sits in the top-8% or bottom-8% margin (running header/footer)."""
+        bbox = line.get("bbox")  # (x0, y0, x1, y1)
+        if not bbox or page_height <= 0:
+            return False
+        y0, y1 = bbox[1], bbox[3]
+        mid_y = (y0 + y1) / 2.0
+        return mid_y < page_height * 0.08 or mid_y > page_height * 0.92
+
+    def _find_heading_span(
+        page,
+        page_dict: dict,
+        heading_text: str,
+        body_size: float,
+    ) -> bool:
+        """
+        Return True if this page has a heading-quality occurrence of heading_text.
+
+        Signal 2 — prefixed full string (skip body-text mentions entirely).
+        Signal 3 + 4 + 5 — font size, header/footer exclusion, standalone line.
+        """
+        ht_full = heading_text.strip()
+        ht_stripped = _strip_prefix(ht_full)
+        has_pfx = _has_prefix(ht_full)
+        page_height = page.rect.height
+
+        # Signal 2: search for full prefixed string — match = definitely the heading
+        if has_pfx:
+            for candidate in [
+                ht_full, _expand_ligatures(ht_full),
+                ht_full.lower(), _expand_ligatures(ht_full).lower(),
+            ]:
+                if page.search_for(candidate, quads=False):
+                    return True
+
+        # Signals 3+4+5: walk spans for the stripped heading name
+        target_norm = _norm(ht_stripped)
+        if not target_norm:
+            return False
+
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                # Signal 4: skip running headers / footers
+                if _in_header_footer_zone(line, page_height):
+                    continue
+
+                spans = line.get("spans", [])
+                line_norm = _norm("".join(s.get("text", "") for s in spans))
+
+                if target_norm not in line_norm:
+                    continue
+
+                for span in spans:
+                    span_norm = _norm(span.get("text", ""))
+                    if target_norm not in span_norm and span_norm not in target_norm:
+                        continue
+
+                    # Signal 3: font size >= 95% of body baseline
+                    if span.get("size", 0) < body_size * 0.95:
+                        continue
+
+                    # Signal 5: heading should dominate its line (<=20 extra chars)
+                    if len(line_norm) - len(target_norm) > 20:
+                        continue
+
+                    return True
+
+        return False
+
+    # ── Main anchoring loop ───────────────────────────────────────────────────
+    corrected = 0
+    for sec in merged:
+        vision_page = sec["page_start"]
+        lo = max(1, vision_page - search_window)
+        hi = min(total_pages, vision_page + 1)
+
+        best_page: Optional[int] = None
+        for pnum in range(lo, hi + 1):
+            try:
+                page = doc[pnum - 1]
+                page_dict = page.get_text("dict", flags=0)
+                body_size = _modal_font_size(page_dict)
+                if _find_heading_span(page, page_dict, sec["heading"], body_size):
+                    best_page = pnum
+                    break
+            except Exception as exc:
+                logger.debug("[VISION_HEADING] Anchor error page %d: %s", pnum, exc)
+
+        if best_page is not None and best_page != vision_page:
+            logger.info(
+                "[VISION_HEADING] Anchor corrected '%s': page %d -> %d",
+                sec["heading"], vision_page, best_page,
+            )
+            sec["page_start"] = best_page
+            corrected += 1
+
+    if corrected:
+        logger.info(
+            "[VISION_HEADING] PyMuPDF anchoring corrected %d/%d heading(s)",
+            corrected, len(merged),
+        )
+        merged.sort(key=lambda x: x["page_start"])
+        for i, section in enumerate(merged):
+            if i + 1 < len(merged):
+                section["page_end"] = merged[i + 1]["page_start"]
+            else:
+                section["page_end"] = total_pages
 
     return merged
 
@@ -611,10 +843,17 @@ def extract_sections_via_vision_headings(
                 logger.error("[VISION_HEADING] Batch %d raised exception: %s", i, e)
                 batch_results[i] = []
 
-    doc.close()
-
     # ── 5. Merge + deduplicate headings across batches ────────────────────────
     merged = _merge_batch_results(batch_results, total_pages)
+
+    # ── 5b. PyMuPDF anchoring: correct off-by-one page errors from vision ─────
+    # The vision model sometimes assigns a heading to the page AFTER where the
+    # heading text physically appears (bottom-of-page effect). We use PyMuPDF's
+    # exact text search to pin each heading to its true page. doc is still open.
+    if merged:
+        merged = _anchor_headings_with_pymupdf(merged, doc, total_pages)
+
+    doc.close()
 
     if not merged:
         return _err(
