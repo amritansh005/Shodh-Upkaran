@@ -12,11 +12,14 @@ Flow:
     3. For all other types: embed question → pgvector similarity search →
        build context → call GPT-4o with context + question.
     4. (references mode) Also append tail chunks (end of paper).
+    5. Simple reference metadata questions (count / last number / invalid
+       reference number) are answered directly from stored DB metadata.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import List, Literal, Optional
 
 from pdf_ingestion.app.paper_store import PaperStore, STATUS_READY
@@ -45,18 +48,8 @@ REF_TOP_K = 80
 REF_MAX_CONTEXT_CHARS = 40000  # references lists are long — give them enough room
 REF_TAIL_CHUNKS = 30  # last 30 chunks covers ~12 pages, enough for any references section
 
-# Question type labels returned by GPT-4o classifier.
-# "outline" is a dedicated label for "show me the document structure" intent,
-# allowing the LLM to recognise this regardless of the exact words used
-# ("sections", "headings", "chapters", "table of contents", "show me the outline",
-# "what sections does this paper have", etc.) — no keyword list needed.
 QuestionType = Literal["outline", "structural", "references", "specific"]
 
-# Hard override only for references — this intent is unambiguous and benefits
-# from a fast, stable bypass of the LLM classifier.
-# Structural/outline routing is intentionally left to the LLM: keyword lists
-# are brittle and miss paraphrases like "walk me through the sections" or
-# "what topics does this paper cover?".
 _HARD_REFERENCES_KEYWORDS = (
     "references",
     "bibliography",
@@ -66,31 +59,27 @@ _HARD_REFERENCES_KEYWORDS = (
     "cited works",
 )
 
-# Generic section-name fragments used as a fallback when no HeadingTree is
-# available.  Dynamic matching against the paper's actual stored section
-# headings is always tried first (see _detect_section_filter).
 _GENERIC_SECTION_TRIGGER_MAP = (
-    # (question keyword,          section heading fragment to filter on)
-    ("abstract",                  "abstract"),
-    ("introduction",              "introduction"),
-    ("related work",              "related work"),
-    ("literature review",         "related work"),
-    ("background",                "background"),
-    ("methodology",               "methodology"),
-    ("method",                    "method"),
-    ("approach",                  "approach"),
-    ("experiment",                "experiment"),
-    ("evaluation",                "evaluation"),
-    ("results",                   "result"),
-    ("findings",                  "result"),
-    ("discussion",                "discussion"),
-    ("conclusion",                "conclusion"),
-    ("future work",               "future"),
-    ("limitation",                "limitation"),
-    ("dataset",                   "dataset"),
-    ("implementation",            "implementation"),
-    ("architecture",              "architecture"),
-    ("contribution",              "contribution"),
+    ("abstract", "abstract"),
+    ("introduction", "introduction"),
+    ("related work", "related work"),
+    ("literature review", "related work"),
+    ("background", "background"),
+    ("methodology", "methodology"),
+    ("method", "method"),
+    ("approach", "approach"),
+    ("experiment", "experiment"),
+    ("evaluation", "evaluation"),
+    ("results", "result"),
+    ("findings", "result"),
+    ("discussion", "discussion"),
+    ("conclusion", "conclusion"),
+    ("future work", "future"),
+    ("limitation", "limitation"),
+    ("dataset", "dataset"),
+    ("implementation", "implementation"),
+    ("architecture", "architecture"),
+    ("contribution", "contribution"),
 )
 
 _HEADING_SYSTEM_PROMPT = """\
@@ -207,53 +196,27 @@ def _detect_section_filter(question: str, stored_headings: Optional[List[str]] =
     """
     Detect if a question targets a specific named section and return the
     heading fragment to pass to search_chunks(section_heading=...).
-
-    Strategy (in order):
-    1. DYNAMIC: scan the paper's actual stored section headings for any
-       heading whose significant words all appear in the question.  This
-       handles any paper-specific heading — "Training Phase", "Dataset
-       Building", "Adversarial Attacks on NLP", etc. — without needing
-       them in a static list.
-    2. GENERIC FALLBACK: check the static _GENERIC_SECTION_TRIGGER_MAP
-       for common cross-paper section names (abstract, introduction, …).
-
-    Returns the best-matching heading text, or None if nothing matches.
-
-    Examples (dynamic, from stored headings):
-      question "Whats inside Training Phase?" + stored "2. Training Phase"
-        → returns "Training Phase"   (matched by significant words)
-      question "tell me about Dataset Building"
-        → returns "Dataset Building"
-
-    Examples (generic fallback):
-      "what does the methodology say?" → "method"
-      "summarise the results"          → "result"
     """
-    import re
-
     q_lower = question.lower()
 
-    # ── 1. Dynamic match against stored headings ─────────────────────────────
     if stored_headings:
-        # Strip numbering/punctuation from each heading and extract significant words
-        # (length > 3 to skip roman numerals, "the", "and", etc.)
         _strip_re = re.compile(r"^[IVXivx\d]+[.)]\s*|^[A-Za-z][.)]\s*")
 
         best_match: Optional[str] = None
-        best_score = 0
+        best_score = 0.0
 
         for heading in stored_headings:
-            # Remove leading numbering (e.g. "2. ", "A. ", "IX. ")
             clean = _strip_re.sub("", heading).strip()
             words = [w for w in re.findall(r"[a-z]+", clean.lower()) if len(w) > 3]
             if not words:
                 continue
-            # Score = fraction of significant words found in the question
+
             matched = sum(1 for w in words if w in q_lower)
             score = matched / len(words)
+
             if score > best_score and matched >= max(1, len(words) // 2):
                 best_score = score
-                best_match = clean  # use the clean heading (without numbering)
+                best_match = clean
 
         if best_match and best_score >= 0.5:
             logger.debug(
@@ -262,10 +225,55 @@ def _detect_section_filter(question: str, stored_headings: Optional[List[str]] =
             )
             return best_match
 
-    # ── 2. Generic fallback ──────────────────────────────────────────────────
     for question_kw, section_fragment in _GENERIC_SECTION_TRIGGER_MAP:
         if question_kw in q_lower:
             return section_fragment
+
+    return None
+
+
+def _is_reference_count_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    return (
+        ("how many" in q and ("reference" in q or "citation" in q))
+        or ("number of references" in q)
+        or ("number of citations" in q)
+        or ("total references" in q)
+        or ("total citations" in q)
+        or ("count the references" in q)
+        or ("count of references" in q)
+    )
+
+
+def _is_last_reference_number_question(question: str) -> bool:
+    q = (question or "").strip().lower()
+    return (
+        ("last reference number" in q)
+        or ("highest reference number" in q)
+        or ("largest reference number" in q)
+        or ("final reference number" in q)
+        or ("last citation number" in q)
+        or ("highest citation number" in q)
+        or ("largest citation number" in q)
+    )
+
+
+def _extract_requested_reference_number(question: str) -> Optional[int]:
+    q = (question or "").strip().lower()
+
+    patterns = [
+        r"\b(?:reference|citation)\s*(?:number\s*)?(\d{1,4})\b",
+        r"\b(?:show|give|find|get|fetch|list)\s+(?:me\s+)?(?:reference|citation)\s*(?:number\s*)?(\d{1,4})\b",
+        r"\bwhat\s+is\s+(?:reference|citation)\s*(?:number\s*)?(\d{1,4})\b",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, q)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                return None
 
     return None
 
@@ -278,11 +286,6 @@ class QAService:
     def _hard_route(self, question: str) -> QuestionType | None:
         """
         Cheap, deterministic bypass for references questions only.
-        These keywords are unambiguous and benefit from skipping the LLM call.
-
-        Structural and outline routing is intentionally NOT done here — those
-        intents have too many paraphrases to be caught reliably by keywords,
-        so they are left entirely to the LLM classifier.
         """
         q = (question or "").strip().lower()
         if not q:
@@ -297,15 +300,7 @@ class QAService:
         """
         Ask GPT-4o to classify the question as one of:
           'outline' | 'structural' | 'references' | 'specific'
-
-        'outline' means the user wants the document structure listed from the
-        stored HeadingTree — regardless of whether they said "headings",
-        "sections", "chapters", "table of contents", "topics", etc.
-
-        Falls back to 'specific' if the LLM is unavailable or returns an
-        unexpected label, so retrieval always continues.
         """
-        # Hard bypass for references (fast + unambiguous)
         hard = self._hard_route(question)
         if hard is not None:
             logger.info("[QA] Hard-routed question as '%s': %r", hard, question)
@@ -324,7 +319,6 @@ class QAService:
                 temperature=0.0,
             )
 
-            # Robust normalisation: strip whitespace + common punctuation
             label = (raw or "").strip().lower().strip(" \t\r\n.:-\"'`")
 
             if label in ("outline", "structural", "references", "specific"):
@@ -351,21 +345,14 @@ class QAService:
         if not question:
             return "Please ask a question about the paper."
 
-        # Verify paper is ready
         status = self._store.get_paper_status(arxiv_id)
         if status != STATUS_READY:
             if status == "processing":
                 return "The paper is still being processed. Please try again in a moment."
             return "This paper hasn't been ingested yet. Open it first with `open <n>`."
 
-        # ── Classify the question (single LLM call decides all routing) ───────
         question_type = self._classify_question(question)
 
-        # ── Fast path: outline questions answered from stored HeadingTree ─────
-        # The classifier emits "outline" for any question whose intent is
-        # "show me the document structure" — regardless of exact wording.
-        # This bypasses embedding retrieval entirely and gives a consistent
-        # answer sourced from the vision-extracted heading tree.
         if question_type == "outline":
             stored_json = self._store.get_headings(arxiv_id)
             if stored_json:
@@ -375,13 +362,12 @@ class QAService:
                         "[QA] Outline fast-path: %d headings stored for %s",
                         len(tree.headings), arxiv_id,
                     )
-                    # format_for_display: levels 1+2 only — clean user-facing TOC.
-                    # format_for_llm: all levels — gives the LLM full context to
-                    # answer follow-up questions accurately.
                     display_outline = tree.format_for_display()
-                    full_outline    = tree.format_for_llm()
+                    full_outline = tree.format_for_llm()
+
                     if not self._llm.enabled():
                         return display_outline
+
                     try:
                         answer = self._llm.chat(
                             messages=[
@@ -398,12 +384,57 @@ class QAService:
                             temperature=0.0,
                         )
                         return answer.strip() if answer else display_outline
-                    except Exception as _e:
-                        logger.error("[QA] Outline fast-path LLM call failed: %s", _e)
+                    except Exception as e:
+                        logger.error("[QA] Outline fast-path LLM call failed: %s", e)
                         return display_outline
-            # HeadingTree unavailable — fall through to RAG with structural mode
+
             logger.info("[QA] Outline fast-path: no HeadingTree stored, falling back to RAG")
             question_type = "structural"
+
+        # ── Fast path: answer simple references questions from stored metadata ──
+        if question_type == "references":
+            try:
+                ref_meta = self._store.get_reference_metadata(arxiv_id)
+            except Exception as e:
+                logger.warning("[QA] get_reference_metadata failed for %s: %s", arxiv_id, e)
+                ref_meta = None
+
+            if ref_meta:
+                ref_count = ref_meta.get("reference_count")
+                last_ref_num = ref_meta.get("last_reference_number")
+                ref_heading = ref_meta.get("reference_heading")
+                ref_start_page = ref_meta.get("reference_start_page")
+                ref_end_page = ref_meta.get("reference_end_page")
+
+                if _is_reference_count_question(question):
+                    if ref_count is not None:
+                        if ref_heading and ref_start_page and ref_end_page:
+                            if ref_start_page == ref_end_page:
+                                return (
+                                    f"There are {ref_count} references in the paper. "
+                                    f"They appear under the '{ref_heading}' section on page {ref_start_page}."
+                                )
+                            return (
+                                f"There are {ref_count} references in the paper. "
+                                f"They appear under the '{ref_heading}' section on pages {ref_start_page}–{ref_end_page}."
+                            )
+                        return f"There are {ref_count} references in the paper."
+
+                    if last_ref_num is not None:
+                        return f"There are {last_ref_num} references in the paper."
+
+                if _is_last_reference_number_question(question):
+                    if last_ref_num is not None:
+                        return f"The last reference number is {last_ref_num}."
+
+                requested_ref_num = _extract_requested_reference_number(question)
+                if requested_ref_num is not None and last_ref_num is not None:
+                    if requested_ref_num > last_ref_num:
+                        return (
+                            f"Reference {requested_ref_num} does not exist in this paper. "
+                            f"The last reference number is {last_ref_num}."
+                        )
+
         is_references = question_type == "references"
         is_structural = question_type in ("structural", "references")
 
@@ -416,30 +447,21 @@ class QAService:
             max_chars = FULL_DOC_MAX_CONTEXT_CHARS if is_structural else MAX_CONTEXT_CHARS
             system_prompt = _STRUCTURAL_SYSTEM_PROMPT if is_structural else _QA_SYSTEM_PROMPT
 
-        # Detect if question targets a specific named section.
-        # When detected: fetch ALL chunks from that section (top_k=None) in
-        # document order and pass the full section to GPT-4o.
-        #
-        # Runs for BOTH "specific" AND "structural" questions — e.g.
-        # "summarize the methodology section" is classified as structural but
-        # should still deliver all methodology chunks in order, not a scattered
-        # top-50 similarity search.
         section_filter = None
         stored_heading_texts: Optional[List[str]] = None
         if not is_references:
             try:
-                _hj = self._store.get_headings(arxiv_id)
-                if _hj:
-                    _ht = HeadingTree.from_json(_hj)
-                    stored_heading_texts = [h.text for h in _ht.headings]
+                headings_json = self._store.get_headings(arxiv_id)
+                if headings_json:
+                    heading_tree = HeadingTree.from_json(headings_json)
+                    stored_heading_texts = [h.text for h in heading_tree.headings]
             except Exception:
-                pass
+                stored_heading_texts = None
+
             section_filter = _detect_section_filter(question, stored_heading_texts)
             if section_filter:
-                top_k     = None                    # fetch EVERY chunk from this section
+                top_k = None
                 max_chars = SECTION_MAX_CONTEXT_CHARS
-                # Use specific QA prompt — structural prompt's heading-list rules
-                # conflict with full section dumps.
                 system_prompt = _QA_SYSTEM_PROMPT
                 logger.info(
                     "[QA] Section filter detected: %r → %r  (top_k=None, max_chars=%d)",
@@ -451,16 +473,19 @@ class QAService:
             arxiv_id, is_structural, is_references, section_filter, top_k, max_chars, question,
         )
 
-        # Embed the question
         try:
             query_vec = get_embedder().embed_query(question)
         except Exception as e:
             logger.error("[QA] embed_query failed: %s", e)
             return "Sorry, I had trouble processing your question. Please try again."
 
-        # Retrieve chunks — ALL from the section when filter active, top_k otherwise
         try:
-            hits = self._store.search_chunks(arxiv_id, query_vec, top_k=top_k, section_heading=section_filter)
+            hits = self._store.search_chunks(
+                arxiv_id,
+                query_vec,
+                top_k=top_k,
+                section_heading=section_filter,
+            )
         except Exception as e:
             logger.error("[QA] search_chunks failed: %s", e)
             return "Sorry, I couldn't search the paper content. Please try again."
@@ -468,7 +493,6 @@ class QAService:
         if not hits:
             return "I have no content stored for this paper. Try re-opening it with `open <n>`."
 
-        # (References mode) Always include the last N chunks
         if is_references:
             tail_hits = []
             if hasattr(self._store, "get_tail_chunks"):
@@ -482,6 +506,7 @@ class QAService:
                 merged = {ci: (ci, text, score, sec) for ci, text, score, sec in hits}
                 for ci, text, score, sec in tail_hits:
                     merged.setdefault(ci, (ci, text, score, sec))
+
                 tail_indices = {ci for ci, _, _, _ in tail_hits}
                 tail_part = sorted(
                     [v for v in merged.values() if v[0] in tail_indices],
@@ -493,13 +518,9 @@ class QAService:
                 )
                 hits = tail_part + other_part
 
-        # Sort by chunk_index (document order) for structural questions OR
-        # when a section filter is active — guarantees the LLM sees the section
-        # in reading order, not ranked by similarity score.
         if is_structural or section_filter:
             hits = sorted(hits, key=lambda h: h[0])
 
-        # Build context (cap at max_chars)
         context_parts: List[str] = []
         total = 0
         for _ci, text, _score, _sec in hits:
@@ -522,7 +543,6 @@ class QAService:
             f"Question: {question}"
         )
 
-        # Call LLM
         if not self._llm.enabled():
             return (
                 "LLM not configured. Here are the most relevant excerpts:\n\n"

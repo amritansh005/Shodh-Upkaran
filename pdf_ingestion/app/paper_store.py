@@ -4,20 +4,26 @@ paper_store.py — PostgreSQL + pgvector storage for papers and chunks.
 Tables
 ------
 papers
-    arxiv_id        TEXT  PRIMARY KEY
-    title           TEXT
-    authors         TEXT
-    pdf_url         TEXT
-    abstract        TEXT
-    published_date  TEXT
-    status          TEXT   ('pending' | 'processing' | 'ready' | 'failed')
-    pdf_bytes       BYTEA
-    total_pages     INTEGER
-    used_ocr        BOOLEAN
-    error_msg       TEXT
-    paper_headings  TEXT   -- JSON: [{level,text,page}, ...]
-    created_at      TIMESTAMPTZ
-    updated_at      TIMESTAMPTZ
+    arxiv_id                  TEXT  PRIMARY KEY
+    title                     TEXT
+    authors                   TEXT
+    pdf_url                   TEXT
+    abstract                  TEXT
+    published_date            TEXT
+    status                    TEXT   ('pending' | 'processing' | 'ready' | 'failed')
+    pdf_bytes                 BYTEA
+    total_pages               INTEGER
+    used_ocr                  BOOLEAN
+    error_msg                 TEXT
+    paper_headings            TEXT   -- JSON: [{level,text,page}, ...]
+    reference_heading         TEXT
+    reference_start_page      INTEGER
+    reference_end_page        INTEGER
+    reference_count           INTEGER
+    last_reference_number     INTEGER
+    reference_numbering_style TEXT
+    created_at                TIMESTAMPTZ
+    updated_at                TIMESTAMPTZ
 
 paper_chunks
     id              BIGSERIAL PRIMARY KEY
@@ -46,17 +52,17 @@ paper_sections
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import psycopg2
 import psycopg2.extras
 
 logger = logging.getLogger(__name__)
 
-STATUS_PENDING    = "pending"
+STATUS_PENDING = "pending"
 STATUS_PROCESSING = "processing"
-STATUS_READY      = "ready"
-STATUS_FAILED     = "failed"
+STATUS_READY = "ready"
+STATUS_FAILED = "failed"
 
 
 class PaperStore:
@@ -82,27 +88,39 @@ class PaperStore:
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS papers (
-                        arxiv_id        TEXT PRIMARY KEY,
-                        title           TEXT NOT NULL DEFAULT '',
-                        authors         TEXT NOT NULL DEFAULT '',
-                        pdf_url         TEXT NOT NULL DEFAULT '',
-                        abstract        TEXT NOT NULL DEFAULT '',
-                        published_date  TEXT NOT NULL DEFAULT '',
-                        status          TEXT NOT NULL DEFAULT 'pending',
-                        pdf_bytes       BYTEA,
-                        total_pages     INTEGER,
-                        used_ocr        BOOLEAN DEFAULT FALSE,
-                        error_msg       TEXT,
-                        paper_headings  TEXT,
-                        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        arxiv_id                  TEXT PRIMARY KEY,
+                        title                     TEXT NOT NULL DEFAULT '',
+                        authors                   TEXT NOT NULL DEFAULT '',
+                        pdf_url                   TEXT NOT NULL DEFAULT '',
+                        abstract                  TEXT NOT NULL DEFAULT '',
+                        published_date            TEXT NOT NULL DEFAULT '',
+                        status                    TEXT NOT NULL DEFAULT 'pending',
+                        pdf_bytes                 BYTEA,
+                        total_pages               INTEGER,
+                        used_ocr                  BOOLEAN DEFAULT FALSE,
+                        error_msg                 TEXT,
+                        paper_headings            TEXT,
+                        reference_heading         TEXT,
+                        reference_start_page      INTEGER,
+                        reference_end_page        INTEGER,
+                        reference_count           INTEGER,
+                        last_reference_number     INTEGER,
+                        reference_numbering_style TEXT,
+                        created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     );
                 """)
 
-                # Safe migration for existing databases
+                # Safe migrations for existing databases
                 cur.execute("""
                     ALTER TABLE papers
-                        ADD COLUMN IF NOT EXISTS paper_headings TEXT;
+                        ADD COLUMN IF NOT EXISTS paper_headings TEXT,
+                        ADD COLUMN IF NOT EXISTS reference_heading TEXT,
+                        ADD COLUMN IF NOT EXISTS reference_start_page INTEGER,
+                        ADD COLUMN IF NOT EXISTS reference_end_page INTEGER,
+                        ADD COLUMN IF NOT EXISTS reference_count INTEGER,
+                        ADD COLUMN IF NOT EXISTS last_reference_number INTEGER,
+                        ADD COLUMN IF NOT EXISTS reference_numbering_style TEXT;
                 """)
 
                 cur.execute("""
@@ -287,6 +305,89 @@ class PaperStore:
                 return row[0] if row else None
 
     # ------------------------------------------------------------------
+    # Reference metadata
+    # ------------------------------------------------------------------
+
+    def save_reference_metadata(
+        self,
+        arxiv_id: str,
+        reference_heading: Optional[str],
+        reference_start_page: Optional[int],
+        reference_end_page: Optional[int],
+        reference_count: Optional[int],
+        last_reference_number: Optional[int],
+        reference_numbering_style: Optional[str],
+    ) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE papers
+                    SET
+                        reference_heading = %s,
+                        reference_start_page = %s,
+                        reference_end_page = %s,
+                        reference_count = %s,
+                        last_reference_number = %s,
+                        reference_numbering_style = %s,
+                        updated_at = NOW()
+                    WHERE arxiv_id = %s;
+                """, (
+                    reference_heading,
+                    reference_start_page,
+                    reference_end_page,
+                    reference_count,
+                    last_reference_number,
+                    reference_numbering_style,
+                    arxiv_id,
+                ))
+            conn.commit()
+
+    def get_reference_metadata(self, arxiv_id: str) -> Optional[Dict[str, Optional[object]]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        reference_heading,
+                        reference_start_page,
+                        reference_end_page,
+                        reference_count,
+                        last_reference_number,
+                        reference_numbering_style
+                    FROM papers
+                    WHERE arxiv_id = %s;
+                """, (arxiv_id,))
+                row = cur.fetchone()
+
+                if not row:
+                    return None
+
+                return {
+                    "reference_heading": row[0],
+                    "reference_start_page": row[1],
+                    "reference_end_page": row[2],
+                    "reference_count": row[3],
+                    "last_reference_number": row[4],
+                    "reference_numbering_style": row[5],
+                }
+
+    def clear_reference_metadata(self, arxiv_id: str) -> None:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE papers
+                    SET
+                        reference_heading = NULL,
+                        reference_start_page = NULL,
+                        reference_end_page = NULL,
+                        reference_count = NULL,
+                        last_reference_number = NULL,
+                        reference_numbering_style = NULL,
+                        updated_at = NOW()
+                    WHERE arxiv_id = %s;
+                """, (arxiv_id,))
+            conn.commit()
+
+    # ------------------------------------------------------------------
     # Chunk CRUD
     # ------------------------------------------------------------------
 
@@ -359,7 +460,6 @@ class PaperStore:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 if section_heading and top_k is None:
-                    # Fetch ALL chunks from this section in document order — no LIMIT
                     cur.execute("""
                         SELECT chunk_index, text,
                                1 - (embedding <=> %s::vector) AS score,
@@ -370,7 +470,6 @@ class PaperStore:
                         ORDER BY chunk_index ASC;
                     """, (embedding_str, arxiv_id, f"%{section_heading}%"))
                 elif section_heading:
-                    # Section filter with top_k cap
                     cur.execute("""
                         SELECT chunk_index, text,
                                1 - (embedding <=> %s::vector) AS score,
@@ -382,7 +481,6 @@ class PaperStore:
                         LIMIT %s;
                     """, (embedding_str, arxiv_id, f"%{section_heading}%", embedding_str, top_k))
                 else:
-                    # No section filter — standard similarity search with top_k cap
                     cur.execute("""
                         SELECT chunk_index, text,
                                1 - (embedding <=> %s::vector) AS score,
@@ -456,6 +554,7 @@ class PaperStore:
         """
         if not sections:
             return
+
         with self._connect() as conn:
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(
@@ -505,13 +604,13 @@ class PaperStore:
                 rows = cur.fetchall()
                 return [
                     {
-                        "section_index":  r[0],
-                        "heading_level":  r[1],
-                        "heading_text":   r[2],
+                        "section_index": r[0],
+                        "heading_level": r[1],
+                        "heading_text": r[2],
                         "parent_heading": r[3],
-                        "page_start":     r[4],
-                        "page_end":       r[5],
-                        "content_text":   r[6],
+                        "page_start": r[4],
+                        "page_end": r[5],
+                        "content_text": r[6],
                         "content_length": r[7],
                     }
                     for r in rows
@@ -555,13 +654,14 @@ class PaperStore:
                 row = cur.fetchone()
                 if not row:
                     return None
+
                 return {
-                    "section_index":  row[0],
-                    "heading_level":  row[1],
-                    "heading_text":   row[2],
+                    "section_index": row[0],
+                    "heading_level": row[1],
+                    "heading_text": row[2],
                     "parent_heading": row[3],
-                    "page_start":     row[4],
-                    "page_end":       row[5],
-                    "content_text":   row[6],
+                    "page_start": row[4],
+                    "page_end": row[5],
+                    "content_text": row[6],
                     "content_length": row[7],
                 }

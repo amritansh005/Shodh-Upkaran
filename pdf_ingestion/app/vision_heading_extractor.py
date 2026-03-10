@@ -34,6 +34,7 @@ import base64
 import json
 import logging
 import re
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -133,6 +134,138 @@ Important reminders:
 - Ignore title, authors, affiliations, emails, keywords, captions, and subsection headings.
 - Return only headings that visually look like MAIN section headings.
 """
+
+# ---------------------------------------------------------------------------
+# Patterns / labels
+# ---------------------------------------------------------------------------
+
+_ROMAN_PREFIX_RE = re.compile(r"^\s*([IVXivx]+)[.)]\s+")
+_ARABIC_PREFIX_RE = re.compile(r"^\s*(\d+)[.)]\s+")
+_SUBSECTION_DECIMAL_RE = re.compile(r"^\s*\d+\.\d+")
+_ALPHA_PREFIX_RE = re.compile(r"^\s*[A-Z][.)]\s+")
+_ROMAN_HYPHEN_SUB_RE = re.compile(r"^\s*[IVXivx]+[-–—][A-Z0-9]+")
+_APPENDIX_RE = re.compile(r"^\s*appendix(?:\s+[A-Z0-9]+)?\b", re.IGNORECASE)
+
+_MANDATORY_UNNUMBERED_HEADINGS = {
+    "abstract",
+    "acknowledgements",
+    "acknowledgments",
+    "references",
+    "reference",
+    "bibliography",
+    "appendix",
+    "appendices",
+    "conclusion",
+    "conclusions",
+}
+
+_COMMON_SECTION_WORDS = {
+    "abstract",
+    "introduction",
+    "background",
+    "related work",
+    "prior research",
+    "research methodology",
+    "methodology",
+    "method",
+    "approach",
+    "experiments",
+    "experimental setup",
+    "evaluation",
+    "results",
+    "discussion",
+    "conclusion",
+    "conclusions",
+    "future work",
+    "limitations",
+    "references",
+    "reference",
+    "bibliography",
+    "appendix",
+    "appendices",
+    "acknowledgements",
+    "acknowledgments",
+}
+
+_ROMAN_TO_INT: Dict[str, int] = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+    "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
+    "XI": 11, "XII": 12, "XIII": 13, "XIV": 14, "XV": 15,
+    "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19, "XX": 20,
+}
+_INT_TO_ROMAN: Dict[int, str] = {v: k for k, v in _ROMAN_TO_INT.items()}
+
+# ---------------------------------------------------------------------------
+# Ligature normalisation table
+# ---------------------------------------------------------------------------
+_LIGATURES: Dict[str, str] = {
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+    "\ufb05": "st",
+    "\ufb06": "st",
+    "\u0133": "ij",
+    "\u0132": "IJ",
+}
+
+
+def _expand_ligatures(s: str) -> str:
+    for lig, exp in _LIGATURES.items():
+        s = s.replace(lig, exp)
+    return s
+
+
+def _norm(s: str) -> str:
+    s = _expand_ligatures(s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _strip_prefix(h: str) -> str:
+    h = re.sub(r"^\s*[IVXivx]+[.)]\s*", "", h)
+    h = re.sub(r"^\s*\d+[.)]\s*", "", h)
+    return h.strip()
+
+
+def _heading_prefix_kind(h: str) -> str:
+    text = h.strip()
+
+    if _SUBSECTION_DECIMAL_RE.match(text):
+        return "decimal-subsection"
+    if _ROMAN_HYPHEN_SUB_RE.match(text):
+        return "roman-hyphen-subsection"
+    if _APPENDIX_RE.match(text):
+        return "appendix"
+    if _ROMAN_PREFIX_RE.match(text):
+        return "roman"
+    if _ARABIC_PREFIX_RE.match(text):
+        return "arabic"
+    if _ALPHA_PREFIX_RE.match(text):
+        return "alpha-subsection"
+
+    stripped = _strip_prefix(text)
+    if _norm(stripped) in _MANDATORY_UNNUMBERED_HEADINGS:
+        return "mandatory-unnumbered"
+
+    return "unnumbered"
+
+
+def _is_subsection_like_heading(h: str) -> bool:
+    kind = _heading_prefix_kind(h)
+    return kind in {"decimal-subsection", "roman-hyphen-subsection", "alpha-subsection"}
+
+
+def _dominant_top_level_scheme(headings: List[Dict[str, Any]]) -> str:
+    counts = Counter()
+    for sec in headings:
+        kind = _heading_prefix_kind(sec["heading"])
+        if kind in {"roman", "arabic", "appendix"}:
+            counts[kind] += 1
+    if not counts:
+        return "unknown"
+    dominant, n = counts.most_common(1)[0]
+    return dominant if n >= 2 else "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -343,8 +476,15 @@ def _merge_batch_results(
         for item in batch:
             heading = item["heading"].strip()
             page = item["page"]
-            key = re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", heading.lower()).strip()
-            key = re.sub(r"\s+", " ", key)
+
+            if _is_subsection_like_heading(heading):
+                logger.info("[VISION_HEADING] Dropping subsection-like heading at merge: %s", heading)
+                continue
+
+            key = _norm(_strip_prefix(heading))
+            if not key:
+                continue
+
             if key not in seen or page < seen[key]:
                 seen[key] = page
                 canonical[key] = heading
@@ -357,7 +497,7 @@ def _merge_batch_results(
         for k in seen
         if k in canonical
     ]
-    merged.sort(key=lambda x: x["page_start"])
+    merged.sort(key=lambda x: (x["page_start"], _norm(x["heading"])))
 
     for i, section in enumerate(merged):
         if i + 1 < len(merged):
@@ -381,17 +521,6 @@ def _anchor_headings_with_pymupdf(
     """
     Use PyMuPDF font-aware span search to pin each heading to the correct page.
     """
-    from collections import Counter
-
-    def _norm(s: str) -> str:
-        s = _expand_ligatures(s.lower())
-        return re.sub(r"\s+", " ", s).strip()
-
-    def _strip_prefix(h: str) -> str:
-        return re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", h.strip()).strip()
-
-    def _has_prefix(h: str) -> bool:
-        return bool(re.match(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", h.strip()))
 
     def _modal_font_size(page_dict: dict) -> float:
         sizes: List[float] = []
@@ -417,10 +546,10 @@ def _anchor_headings_with_pymupdf(
     def _find_heading_span(page, page_dict: dict, heading_text: str, body_size: float) -> bool:
         ht_full = heading_text.strip()
         ht_stripped = _strip_prefix(ht_full)
-        has_pfx = _has_prefix(ht_full)
+        has_prefixed_number = bool(_ROMAN_PREFIX_RE.match(ht_full) or _ARABIC_PREFIX_RE.match(ht_full))
         page_height = page.rect.height
 
-        if has_pfx:
+        if has_prefixed_number:
             for candidate in [
                 ht_full,
                 _expand_ligatures(ht_full),
@@ -496,7 +625,7 @@ def _anchor_headings_with_pymupdf(
             corrected,
             len(merged),
         )
-        merged.sort(key=lambda x: x["page_start"])
+        merged.sort(key=lambda x: (x["page_start"], _norm(x["heading"])))
         for i, section in enumerate(merged):
             if i + 1 < len(merged):
                 section["page_end"] = merged[i + 1]["page_start"]
@@ -504,6 +633,93 @@ def _anchor_headings_with_pymupdf(
                 section["page_end"] = total_pages
 
     return merged
+
+
+# ---------------------------------------------------------------------------
+# Top-level scheme filtering
+# ---------------------------------------------------------------------------
+
+def _apply_top_level_scheme_filter(
+    merged: List[Dict[str, Any]],
+    total_pages: int,
+) -> List[Dict[str, Any]]:
+    """
+    Keep only headings that fit the dominant top-level section scheme.
+
+    This is the main fix for cases like:
+      - true main sections are Roman-numbered
+      - subsection-like headings such as "3. Post Training Phase" are mistakenly kept
+
+    Rules:
+    - always keep mandatory unnumbered headings
+    - always drop obvious subsection-like headings
+    - if dominant scheme is roman, strongly prefer roman + mandatory unnumbered + appendix
+    - if dominant scheme is arabic, prefer arabic + mandatory unnumbered + appendix
+    - if no dominant scheme, keep a broader set and let later scoring decide
+    """
+    if not merged:
+        return []
+
+    dominant = _dominant_top_level_scheme(merged)
+    logger.info("[VISION_HEADING] Dominant top-level scheme: %s", dominant)
+
+    filtered: List[Dict[str, Any]] = []
+
+    for sec in merged:
+        heading = sec["heading"]
+        kind = _heading_prefix_kind(heading)
+        stripped_norm = _norm(_strip_prefix(heading))
+
+        if _is_subsection_like_heading(heading):
+            logger.info("[VISION_HEADING] Scheme filter dropped subsection-like heading: %s", heading)
+            continue
+
+        if kind in {"mandatory-unnumbered", "appendix"}:
+            filtered.append(sec)
+            continue
+
+        if dominant == "roman":
+            if kind == "roman":
+                filtered.append(sec)
+            elif kind == "unnumbered" and stripped_norm in _COMMON_SECTION_WORDS:
+                filtered.append(sec)
+            else:
+                logger.info("[VISION_HEADING] Scheme filter dropped non-roman heading: %s", heading)
+
+        elif dominant == "arabic":
+            if kind == "arabic":
+                filtered.append(sec)
+            elif kind == "unnumbered" and stripped_norm in _COMMON_SECTION_WORDS:
+                filtered.append(sec)
+            else:
+                logger.info("[VISION_HEADING] Scheme filter dropped non-arabic heading: %s", heading)
+
+        else:
+            # Fallback when scheme is unclear
+            if kind in {"roman", "arabic", "unnumbered"}:
+                filtered.append(sec)
+
+    if not filtered:
+        return []
+
+    filtered.sort(key=lambda x: (x["page_start"], _norm(x["heading"])))
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for sec in filtered:
+        key = (_norm(_strip_prefix(sec["heading"])), sec["page_start"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(sec)
+
+    for i, section in enumerate(deduped):
+        if i + 1 < len(deduped):
+            section["page_end"] = deduped[i + 1]["page_start"]
+        else:
+            section["page_end"] = total_pages
+
+    return deduped
+
 
 # ---------------------------------------------------------------------------
 # Heading confidence scoring
@@ -513,23 +729,21 @@ def _score_headings(
     merged: List[Dict[str, Any]],
     doc,
     total_pages: int,
-    threshold: float = 0.55,
+    threshold: float = 0.62,
 ) -> List[Dict[str, Any]]:
     """
-    Compute confidence score for each detected heading and
-    remove low-confidence headings.
+    Compute confidence score for each detected heading and remove low-confidence headings.
 
-    IMPORTANT:
-    After filtering, page ranges are recomputed so section boundaries stay valid.
+    Revised scoring:
+    - separates "heading-like" from "top-level-heading-like"
+    - penalizes subsection-style numbering when paper scheme suggests otherwise
+    - rewards dominant scheme consistency
+    - rewards page-top placement and stronger typography
     """
-    from collections import Counter
+    if not merged:
+        return []
 
-    def _norm(s: str) -> str:
-        s = _expand_ligatures(s.lower())
-        return re.sub(r"\s+", " ", s).strip()
-
-    def _strip_prefix(h: str) -> str:
-        return re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", h.strip()).strip()
+    dominant_scheme = _dominant_top_level_scheme(merged)
 
     def _modal_font_size(page_dict: dict) -> float:
         sizes = []
@@ -556,25 +770,29 @@ def _score_headings(
     for sec in merged:
         heading = sec["heading"]
         page = sec["page_start"]
+        kind = _heading_prefix_kind(heading)
+        stripped_norm = _norm(_strip_prefix(heading))
 
         try:
             page_obj = doc[page - 1]
             page_dict = page_obj.get_text("dict", flags=0)
             page_height = page_obj.rect.height
         except Exception:
-            # If scoring cannot run, keep the heading rather than losing it
             filtered.append(sec)
             continue
 
         body_size = _modal_font_size(page_dict)
 
-        # Current implementation has no true GPT probability,
-        # so this is treated as a fixed prior.
+        # Base prior: GPT already proposed it
         gpt_score = 1.0
+
         text_match = 0.0
         typo_score = 0.0
+        position_score = 0.0
+        scheme_score = 0.5
+        semantic_score = 0.0
 
-        target = _norm(_strip_prefix(heading))
+        target = stripped_norm
         found = False
 
         for block in page_dict.get("blocks", []):
@@ -590,9 +808,9 @@ def _score_headings(
                 if not line_text:
                     continue
 
-                line_norm = _norm(line_text)
+                line_norm = _norm(_strip_prefix(line_text))
 
-                if target in line_norm:
+                if target and target in line_norm:
                     text_match = 1.0
 
                     max_size = max(
@@ -600,12 +818,27 @@ def _score_headings(
                         default=0,
                     )
 
-                    if max_size >= body_size * 1.10:
+                    if max_size >= body_size * 1.15:
                         typo_score = 1.0
+                    elif max_size >= body_size * 1.05:
+                        typo_score = 0.8
                     elif max_size >= body_size * 0.95:
-                        typo_score = 0.6
+                        typo_score = 0.55
                     else:
                         typo_score = 0.2
+
+                    bbox = line.get("bbox")
+                    if bbox and page_height > 0:
+                        mid_y = (bbox[1] + bbox[3]) / 2.0
+                        rel_y = mid_y / page_height
+                        if rel_y <= 0.22:
+                            position_score = 1.0
+                        elif rel_y <= 0.35:
+                            position_score = 0.7
+                        elif rel_y <= 0.55:
+                            position_score = 0.4
+                        else:
+                            position_score = 0.15
 
                     found = True
                     break
@@ -613,29 +846,94 @@ def _score_headings(
             if found:
                 break
 
-        confidence = (0.5 * gpt_score) + (0.3 * text_match) + (0.2 * typo_score)
+        # Scheme consistency
+        if kind in {"mandatory-unnumbered", "appendix"}:
+            scheme_score = 1.0
+        elif dominant_scheme == "roman":
+            if kind == "roman":
+                scheme_score = 1.0
+            elif kind == "arabic":
+                scheme_score = 0.1
+            elif kind == "unnumbered" and stripped_norm in _COMMON_SECTION_WORDS:
+                scheme_score = 0.8
+            else:
+                scheme_score = 0.25
+        elif dominant_scheme == "arabic":
+            if kind == "arabic":
+                scheme_score = 1.0
+            elif kind == "roman":
+                scheme_score = 0.2
+            elif kind == "unnumbered" and stripped_norm in _COMMON_SECTION_WORDS:
+                scheme_score = 0.8
+            else:
+                scheme_score = 0.3
+        else:
+            if kind in {"roman", "arabic"}:
+                scheme_score = 0.8
+            elif kind == "unnumbered" and stripped_norm in _COMMON_SECTION_WORDS:
+                scheme_score = 0.8
+            else:
+                scheme_score = 0.45
+
+        # Strong penalties for subsection-like forms
+        if kind in {"decimal-subsection", "roman-hyphen-subsection", "alpha-subsection"}:
+            scheme_score = 0.0
+
+        # Semantic hint
+        if stripped_norm in _COMMON_SECTION_WORDS or stripped_norm in _MANDATORY_UNNUMBERED_HEADINGS:
+            semantic_score = 1.0
+        elif any(word in stripped_norm for word in ["introduction", "method", "result", "discussion", "conclusion", "reference"]):
+            semantic_score = 0.7
+        else:
+            semantic_score = 0.3
+
+        confidence = (
+            0.20 * gpt_score
+            + 0.22 * text_match
+            + 0.20 * typo_score
+            + 0.14 * position_score
+            + 0.16 * scheme_score
+            + 0.08 * semantic_score
+        )
 
         logger.info(
-            "[VISION_HEADING] Confidence '%s' page %d → %.2f",
+            "[VISION_HEADING] Confidence '%s' page %d → %.2f | kind=%s scheme=%s text=%.2f typo=%.2f pos=%.2f sem=%.2f",
             heading,
             page,
             confidence,
+            kind,
+            dominant_scheme,
+            text_match,
+            typo_score,
+            position_score,
+            semantic_score,
         )
 
-        if confidence >= threshold:
+        keep = confidence >= threshold
+
+        # Extra hard guard for papers whose top-level style is Roman:
+        # drop simple Arabic headings unless they are known mandatory headings.
+        if dominant_scheme == "roman" and kind == "arabic" and stripped_norm not in _MANDATORY_UNNUMBERED_HEADINGS:
+            logger.warning(
+                "[VISION_HEADING] Dropped Arabic heading under Roman-dominant scheme: '%s' (%.2f)",
+                heading,
+                confidence,
+            )
+            keep = False
+
+        if keep:
             filtered.append(sec)
         else:
             logger.warning(
-                "[VISION_HEADING] Dropped low-confidence heading '%s' (%.2f)",
+                "[VISION_HEADING] Dropped low-confidence/non-top-level heading '%s' (%.2f)",
                 heading,
                 confidence,
             )
 
-    # IMPORTANT: recompute page ranges after filtering
     if not filtered:
         return []
 
-    filtered.sort(key=lambda x: x["page_start"])
+    filtered.sort(key=lambda x: (x["page_start"], _norm(x["heading"])))
 
     for i, section in enumerate(filtered):
         if i + 1 < len(filtered):
@@ -645,21 +943,10 @@ def _score_headings(
 
     return filtered
 
+
 # ---------------------------------------------------------------------------
 # Infer missing numbered sections (gap detection)
 # ---------------------------------------------------------------------------
-
-_ROMAN_TO_INT: Dict[str, int] = {
-    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
-    "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
-    "XI": 11, "XII": 12, "XIII": 13, "XIV": 14, "XV": 15,
-    "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19, "XX": 20,
-}
-_INT_TO_ROMAN: Dict[int, str] = {v: k for k, v in _ROMAN_TO_INT.items()}
-
-_ARABIC_PREFIX_RE = re.compile(r"^(\d+)[.)]\s+")
-_ROMAN_PREFIX_RE = re.compile(r"^([IVXivx]+)[.)]\s+", re.IGNORECASE)
-
 
 def _infer_missing_numbered_sections(
     merged: List[Dict[str, Any]],
@@ -676,14 +963,6 @@ def _infer_missing_numbered_sections(
 
     This keeps recovery generic and avoids hardcoding "Introduction".
     """
-    from collections import Counter
-
-    def _norm(s: str) -> str:
-        s = _expand_ligatures(s.lower())
-        return re.sub(r"\s+", " ", s).strip()
-
-    def _strip_prefix(h: str) -> str:
-        return re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", h.strip()).strip()
 
     def _modal_font_size(page_dict: dict) -> float:
         sizes: List[float] = []
@@ -721,22 +1000,16 @@ def _infer_missing_numbered_sections(
 
         if len(txt_norm) > 120:
             return False
-
         if len(words) > 18:
             return False
-
         if txt.endswith("."):
             return False
-
         if re.match(r"^(figure|fig\.|table)\s+\d+", txt_norm):
             return False
-
         if re.match(r"^[A-Z]\.\s*$", txt.strip()):
             return False
-
         if re.match(r"^\d+\.\d+", txt.strip()):
             return False
-
         if re.match(r"^[A-Z]\.", txt.strip()) and len(words) <= 3:
             return False
 
@@ -963,14 +1236,14 @@ def _infer_missing_numbered_sections(
             }
         )
 
-    MANDATORY_UNNUMBERED = ["abstract", "acknowledgements", "acknowledgments"]
+    mandatory_unnumbered = ["abstract", "acknowledgements", "acknowledgments"]
 
     detected_normalised = {
         re.sub(r"^[IVXivx]+[.)]\s*|^\d+[.)]\s*", "", sec["heading"].lower()).strip()
         for sec in merged
     }
 
-    for label in MANDATORY_UNNUMBERED:
+    for label in mandatory_unnumbered:
         if label in detected_normalised:
             continue
 
@@ -1000,7 +1273,7 @@ def _infer_missing_numbered_sections(
         return merged
 
     combined = merged + new_sections
-    combined.sort(key=lambda x: x["page_start"])
+    combined.sort(key=lambda x: (x["page_start"], _norm(x["heading"])))
 
     for i, sec in enumerate(combined):
         if i + 1 < len(combined):
@@ -1016,28 +1289,6 @@ def _infer_missing_numbered_sections(
     )
 
     return combined
-
-
-# ---------------------------------------------------------------------------
-# Ligature normalisation table
-# ---------------------------------------------------------------------------
-_LIGATURES: Dict[str, str] = {
-    "\ufb00": "ff",
-    "\ufb01": "fi",
-    "\ufb02": "fl",
-    "\ufb03": "ffi",
-    "\ufb04": "ffl",
-    "\ufb05": "st",
-    "\ufb06": "st",
-    "\u0133": "ij",
-    "\u0132": "IJ",
-}
-
-
-def _expand_ligatures(s: str) -> str:
-    for lig, exp in _LIGATURES.items():
-        s = s.replace(lig, exp)
-    return s
 
 
 # ---------------------------------------------------------------------------
@@ -1277,7 +1528,6 @@ def extract_sections_via_vision_headings(
                 logger.error("[VISION_HEADING] Batch %d raised exception: %s", i, e)
                 batch_results[i] = []
 
-    # Extra focused early-pages pass for every PDF
     early_pages_results: List[Dict[str, Any]] = []
     early_pages = list(range(1, min(EARLY_PAGES_FOCUSED_COUNT, total_pages) + 1))
     if early_pages:
@@ -1310,13 +1560,16 @@ def extract_sections_via_vision_headings(
         merged = _infer_missing_numbered_sections(merged, doc, total_pages)
 
     if merged:
-         merged = _score_headings(merged, doc, total_pages)
+        merged = _apply_top_level_scheme_filter(merged, total_pages)
+
+    if merged:
+        merged = _score_headings(merged, doc, total_pages)
 
     doc.close()
 
     if not merged:
         return _err(
-            "GPT-4o Vision found no top-level headings in the PDF. "
+            "GPT-4o Vision found no reliable top-level headings in the PDF. "
             "The paper may use an unusual layout."
         )
 

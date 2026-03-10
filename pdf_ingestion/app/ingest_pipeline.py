@@ -23,10 +23,11 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
-from pdf_ingestion.app.pdf_downloader import download_pdf
 from pdf_ingestion.app.chunker import chunk_sections
 from pdf_ingestion.app.embedder import get_embedder
-from pdf_ingestion.app.paper_store import PaperStore, STATUS_READY, STATUS_PROCESSING
+from pdf_ingestion.app.paper_store import PaperStore, STATUS_PROCESSING, STATUS_READY
+from pdf_ingestion.app.pdf_downloader import download_pdf
+from pdf_ingestion.app.reference_parser import find_reference_section, parse_references
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,8 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
 async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) -> Dict[str, Any]:
     arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
-    title    = str(paper.get("title") or "").strip()
-    pdf_url  = _resolve_pdf_url(paper)
+    title = str(paper.get("title") or "").strip()
+    pdf_url = _resolve_pdf_url(paper)
 
     if not arxiv_id:
         return _fail("", "Could not determine the arXiv ID for this paper.")
@@ -50,10 +51,10 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
     if existing_status == STATUS_READY and store.chunk_count(arxiv_id) > 0:
         logger.info("[INGEST] Already ready: %s", arxiv_id)
         return {
-            "status":   "already_ready",
-            "message":  "Paper downloaded.",
+            "status": "already_ready",
+            "message": "Paper downloaded.",
             "arxiv_id": arxiv_id,
-            "chunks":   store.chunk_count(arxiv_id),
+            "chunks": store.chunk_count(arxiv_id),
             "used_ocr": False,
         }
 
@@ -61,8 +62,8 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         logger.warning("[INGEST] Found stuck 'processing' status for %s — re-ingesting", arxiv_id)
 
     # ── 2. Save metadata + mark processing ───────────────────────────────────
-    authors_str    = _format_authors(paper)
-    abstract       = str(paper.get("abstract") or paper.get("summary") or "").strip()
+    authors_str = _format_authors(paper)
+    abstract = str(paper.get("abstract") or paper.get("summary") or "").strip()
     published_date = str(paper.get("published") or paper.get("published_date") or "").strip()
 
     store.upsert_paper_meta(
@@ -82,7 +83,7 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
 
         if not dl.success:
             store.mark_failed(arxiv_id, dl.error_message or "Download failed.")
-            return _fail(arxiv_id, dl.error_message)
+            return _fail(arxiv_id, dl.error_message or "Download failed.")
 
         store.save_pdf_bytes(arxiv_id, dl.pdf_bytes)
         logger.info("[INGEST] Downloaded: %s  bytes=%d", arxiv_id, len(dl.pdf_bytes))
@@ -92,10 +93,10 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
 
         loop = asyncio.get_running_loop()
 
-        assembly        = None
-        heading_tree    = None
+        assembly = None
+        heading_tree = None
         pdf_total_pages = 0
-        used_ocr        = False
+        used_ocr = False
         extraction_method = "unknown"
 
         # ── 5a. PRIMARY: PyMuPDF + GPT-4o Vision heading extraction ──────────
@@ -105,12 +106,13 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
                 from pdf_ingestion.app.vision_heading_extractor import (
                     extract_sections_via_vision_headings,
                 )
+
                 assembly, heading_tree, pdf_total_pages = await loop.run_in_executor(
                     _EXECUTOR,
                     lambda: extract_sections_via_vision_headings(
-                        pdf_bytes  = dl.pdf_bytes,
-                        llm_client = llm_client,
-                        settings   = settings,
+                        pdf_bytes=dl.pdf_bytes,
+                        llm_client=llm_client,
+                        settings=settings,
                     ),
                 )
 
@@ -118,14 +120,16 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
                     extraction_method = "vision_heading"
                     logger.info(
                         "[INGEST] Vision heading extraction succeeded: %s  sections=%d",
-                        arxiv_id, len(assembly.sections),
+                        arxiv_id,
+                        len(assembly.sections),
                     )
                 else:
                     reason = getattr(assembly, "error", None) or "No sections produced."
                     logger.warning(
                         "[INGEST] Vision heading extraction failed for %s: %s "
                         "— falling back to Marker",
-                        arxiv_id, reason,
+                        arxiv_id,
+                        reason,
                     )
                     assembly = None
                     heading_tree = None
@@ -135,7 +139,9 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
                 logger.error(
                     "[INGEST] Vision heading extraction exception for %s: %s "
                     "— falling back to Marker",
-                    arxiv_id, e, exc_info=True,
+                    arxiv_id,
+                    e,
+                    exc_info=True,
                 )
                 assembly = None
                 heading_tree = None
@@ -156,8 +162,8 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
                 assembly, heading_tree, pdf_total_pages = await loop.run_in_executor(
                     _EXECUTOR,
                     lambda: extract_sections_via_vision(
-                        pdf_bytes = dl.pdf_bytes,
-                        settings  = settings,
+                        pdf_bytes=dl.pdf_bytes,
+                        settings=settings,
                     ),
                 )
                 extraction_method = "marker"
@@ -173,14 +179,19 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
             reason = getattr(assembly, "error", None) or "All extraction methods returned no sections."
             logger.error(
                 "[INGEST] All extraction methods failed: %s  method=%s  reason=%s",
-                arxiv_id, extraction_method, reason,
+                arxiv_id,
+                extraction_method,
+                reason,
             )
             store.mark_failed(arxiv_id, reason)
             return _fail(arxiv_id, reason)
 
         logger.info(
             "[INGEST] Extraction complete: %s  method=%s  sections=%d  pages=%d",
-            arxiv_id, extraction_method, len(assembly.sections), pdf_total_pages,
+            arxiv_id,
+            extraction_method,
+            len(assembly.sections),
+            pdf_total_pages,
         )
 
         # ── 7. Store headings + sections ──────────────────────────────────────
@@ -188,14 +199,56 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
             store.save_headings(arxiv_id, heading_tree.to_json())
             logger.info(
                 "[INGEST] Headings stored: %s  count=%d",
-                arxiv_id, len(heading_tree.headings),
+                arxiv_id,
+                len(heading_tree.headings),
             )
 
         store.delete_sections(arxiv_id)
         store.insert_sections(arxiv_id, assembly.sections)
+
+        # ── 7b. Parse and store reference metadata from reference section ─────
+        try:
+            ref_section = find_reference_section(assembly.sections)
+            if ref_section and getattr(ref_section, "content_text", "").strip():
+                ref_result = parse_references(ref_section.content_text)
+
+                if ref_result and ref_result.count > 0:
+                    store.save_reference_metadata(
+                        arxiv_id=arxiv_id,
+                        reference_heading=ref_section.heading_text,
+                        reference_start_page=ref_section.page_start,
+                        reference_end_page=ref_section.page_end,
+                        reference_count=ref_result.count,
+                        last_reference_number=ref_result.last_reference_number,
+                        reference_numbering_style=ref_result.style,
+                    )
+                    logger.info(
+                        "[INGEST] Reference metadata stored: %s  count=%s  last=%s  style=%s  confidence=%.2f",
+                        arxiv_id,
+                        ref_result.count,
+                        ref_result.last_reference_number,
+                        ref_result.style,
+                        ref_result.confidence,
+                    )
+                else:
+                    logger.info(
+                        "[INGEST] Reference section found but parser could not extract structured metadata: %s",
+                        arxiv_id,
+                    )
+            else:
+                logger.info("[INGEST] No reference section detected: %s", arxiv_id)
+        except Exception as e:
+            logger.warning(
+                "[INGEST] Reference metadata parsing failed for %s: %s",
+                arxiv_id,
+                e,
+                exc_info=True,
+            )
+
         logger.info(
             "[INGEST] Sections stored: %s  count=%d",
-            arxiv_id, len(assembly.sections),
+            arxiv_id,
+            len(assembly.sections),
         )
 
         # ── 8. Chunk ──────────────────────────────────────────────────────────
@@ -211,14 +264,17 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         # ── 9. Embed ──────────────────────────────────────────────────────────
         logger.info("[INGEST] Embedding: %s", arxiv_id)
         embedder = get_embedder()
-        vectors  = embedder.embed_documents([c.text for c in chunks])
+        vectors = embedder.embed_documents([c.text for c in chunks])
 
         # ── 10. Store chunks ──────────────────────────────────────────────────
         store.delete_chunks(arxiv_id)
-        store.insert_chunks(arxiv_id, [
-            (c.chunk_index, c.page_num, c.text, vectors[i], c.section_heading)
-            for i, c in enumerate(chunks)
-        ])
+        store.insert_chunks(
+            arxiv_id,
+            [
+                (c.chunk_index, c.page_num, c.text, vectors[i], c.section_heading)
+                for i, c in enumerate(chunks)
+            ],
+        )
 
         try:
             store.ensure_vector_index()
@@ -229,14 +285,17 @@ async def ingest_paper(paper: Dict[str, Any], store: PaperStore, settings=None) 
         store.mark_ready(arxiv_id, pdf_total_pages, used_ocr)
         logger.info(
             "[INGEST] Complete: %s  method=%s  chunks=%d  pages=%d",
-            arxiv_id, extraction_method, len(chunks), pdf_total_pages,
+            arxiv_id,
+            extraction_method,
+            len(chunks),
+            pdf_total_pages,
         )
 
         return {
-            "status":   "ready",
-            "message":  "Paper downloaded.",
+            "status": "ready",
+            "message": "Paper downloaded.",
             "arxiv_id": arxiv_id,
-            "chunks":   len(chunks),
+            "chunks": len(chunks),
             "used_ocr": used_ocr,
         }
 
@@ -263,11 +322,12 @@ def _build_llm_client(settings):
         return None
     try:
         from pdf_ingestion.app.llm_client import LLMClient
+
         return LLMClient(
-            endpoint    = getattr(settings, "azure_openai_endpoint",    "") or "",
-            api_key     = getattr(settings, "azure_openai_api_key",     "") or "",
-            api_version = getattr(settings, "azure_openai_api_version", "") or "",
-            deployment  = getattr(settings, "azure_openai_deployment",  "") or "",
+            endpoint=getattr(settings, "azure_openai_endpoint", "") or "",
+            api_key=getattr(settings, "azure_openai_api_key", "") or "",
+            api_version=getattr(settings, "azure_openai_api_version", "") or "",
+            deployment=getattr(settings, "azure_openai_deployment", "") or "",
         )
     except Exception as e:
         logger.warning("[INGEST] Could not build LLM client from settings: %s", e)
@@ -276,10 +336,10 @@ def _build_llm_client(settings):
 
 def _fail(arxiv_id: str, message: str) -> Dict[str, Any]:
     return {
-        "status":   "failed",
-        "message":  message,
+        "status": "failed",
+        "message": message,
         "arxiv_id": arxiv_id,
-        "chunks":   0,
+        "chunks": 0,
         "used_ocr": False,
     }
 
@@ -297,6 +357,7 @@ def _resolve_pdf_url(paper: Dict[str, Any]) -> str:
     pdf = str(pdf or "").strip()
     if pdf:
         return pdf
+
     arxiv_id = str(paper.get("arxiv_id") or paper.get("id") or "").strip()
     if arxiv_id:
         return f"https://arxiv.org/pdf/{arxiv_id}.pdf"
