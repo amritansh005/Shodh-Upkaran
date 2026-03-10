@@ -8,12 +8,14 @@ Strategy
    so a heading that starts at the end of one batch is always visible in the next.
 3. GPT-4o returns ONLY top-level headings + start page for each batch. Results are
    merged and deduplicated across batches (same heading → keep lowest start page).
-4. End pages are inferred: section[i].page_end = section[i+1].page_start.
+4. A focused early-pages pass (pages 1-2 by default) is also run at higher quality,
+   because page 1 is usually the densest page in research PDFs.
+5. End pages are inferred: section[i].page_end = section[i+1].page_start.
    Shared boundary pages are given to BOTH neighbouring sections — no content
    is lost, slight duplication at boundaries is acceptable for RAG.
-5. PyMuPDF page text is sliced by these page ranges to build PaperSection objects,
+6. PyMuPDF page text is sliced by these page ranges to build PaperSection objects,
    using column-aware extraction (two-column IEEE/ACM papers handled correctly).
-6. HeadingTree is built from the merged headings for the outline fast-path in QA.
+7. HeadingTree is built from the merged headings for the outline fast-path in QA.
 
 Falls back gracefully:
   - If GPT-4o Vision returns nothing → empty SectionAssembly (caller falls back to Marker)
@@ -28,14 +30,10 @@ Performance
 
 from __future__ import annotations
 
-import asyncio
 import base64
-import io
 import json
 import logging
 import re
-import tempfile
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -43,62 +41,97 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Batch config
 # ---------------------------------------------------------------------------
-BATCH_SIZE    = 10   # pages per GPT-4o Vision call
-BATCH_OVERLAP = 2    # pages repeated at the boundary between batches
-IMAGE_DPI     = 100  # lower DPI = smaller images = faster + cheaper API calls
-                     # 100 DPI is sufficient for reading heading text
+BATCH_SIZE = 10
+BATCH_OVERLAP = 2
+
+# Standard render / vision settings
+IMAGE_DPI = 100
+IMAGE_DETAIL = "low"
+
+# Better quality for the first normal batch (the one containing page 1)
+FIRST_BATCH_IMAGE_DPI = 160
+FIRST_BATCH_IMAGE_DETAIL = "high"
+
+# Extra focused pass for the first few pages of every PDF
+EARLY_PAGES_FOCUSED_COUNT = 2
+EARLY_PAGES_IMAGE_DPI = 180
+EARLY_PAGES_IMAGE_DETAIL = "high"
 
 # ---------------------------------------------------------------------------
 # GPT-4o Vision prompt
 # ---------------------------------------------------------------------------
 _HEADING_EXTRACTION_SYSTEM = """\
-You are a precise document structure extractor.
+You are a precise document-structure extractor.
 
-Your task: extract ONLY the top-level section headings from the provided PDF pages,
-and the page number where each heading STARTS (use the page numbers I give you, not
-any printed page numbers on the paper itself).
+Task:
+Extract ONLY top-level section headings that are visibly present on the provided PDF pages,
+and the page number where each heading STARTS.
 
-Top-level headings are the MAIN sections of the paper such as:
-  Abstract, Introduction, Related Work, Background, Methodology, Method, Approach,
-  Experiments, Evaluation, Results, Discussion, Conclusion, Future Work, Limitations,
-  References, Appendix, Acknowledgements
+Use the page numbers supplied in the prompt, NOT any printed page numbers shown inside the PDF.
 
-Top-level headings may be prefixed with Roman numerals (I, II, III, IV, V, VI, VII,
-VIII, IX, X, XI, XII...) or Arabic numerals (1, 2, 3...). These prefixes are part of
-the heading style, not separate content. For example:
-  "XI. Conclusion" is a top-level heading with page = wherever "XI. Conclusion" appears
-  "V. The Attack Surface of Artificial Intelligence" is also a top-level heading
+What counts as a top-level heading:
+- Main paper sections such as:
+  Abstract, Introduction, Background, Related Work, Prior Research, Methodology,
+  Method, Approach, Experiments, Evaluation, Results, Discussion, Conclusion,
+  Future Work, Limitations, References, Bibliography, Appendix, Acknowledgements.
+- These may appear in different styles:
+  - Unnumbered: "Abstract", "References"
+  - Arabic-numbered: "1. Introduction", "2 Method"
+  - Roman-numbered: "I. Introduction", "II. Prior Research"
+  - Mixed styles within the same paper
+- A heading may appear on the same page as title/authors/affiliations/keywords.
 
-CRITICAL PAGE ASSIGNMENT RULE:
-- A heading belongs to the page where the heading TEXT itself is visible, even if it
-  appears at the very bottom of that page with little or no body text following it.
-- Do NOT assign a heading to the next page just because most of its content is there.
-- If you see a heading at the bottom of page N, its page number is N.
+IMPORTANT:
+- Page 1 may contain MORE THAN ONE top-level heading.
+- Do NOT stop after finding only one heading on a page.
+- Scan the ENTIRE page, including content below affiliations, footnotes, and keywords.
+- If a heading appears at the bottom of a page, assign it to THAT page.
+- A single "I." may be a real Roman numeral heading prefix. Do not assume it is a footnote marker.
+
+ALWAYS include these when they are visibly section headings:
+- Abstract
+- Acknowledgements / Acknowledgments
+- References / Bibliography
+- Appendix / Appendices
 
 DO NOT include:
-  - Sub-headings or lettered subsections (A., B., C., 1.1, 2.3, A.1, etc.)
-  - Figure captions or table titles
-  - Author names, affiliations, paper titles
-  - Any heading you are not confident is a real top-level section
+- The paper title
+- Author names, affiliations, emails, keywords
+- Figure captions or table captions
+- Subsection headings such as:
+  1.1, 2.3, III-A, A., B., C., A.1, etc.
+- Running headers / page headers / footer text
 
-Output format — respond with ONLY a JSON array, no other text:
+Decision rule:
+Return something only if it visually looks like a MAIN section heading.
+Do not invent headings that are not visible.
+
+Output format:
+Return ONLY a JSON array, no extra text:
 [
-  {"heading": "Introduction", "page": 2},
-  {"heading": "Related Work", "page": 4},
-  ...
+  {"heading": "Abstract", "page": 1},
+  {"heading": "I. Introduction", "page": 1},
+  {"heading": "II. Prior Research", "page": 7}
 ]
 
-If you find no top-level headings in these pages, return an empty array: []
+If no top-level headings are visible in these pages, return:
+[]
 """
 
 _HEADING_EXTRACTION_USER = """\
 These are pages {start_page} to {end_page} of a research paper PDF.
 Extract all top-level section headings visible in these pages and the page number
-where each heading starts. Use the page numbers I told you ({start_page} to {end_page}),
-not any printed numbers on the pages.
+where each heading starts.
 
-Remember: if a heading appears at the bottom of a page, assign it to THAT page number,
-not the next one.
+Use the page numbers I told you ({start_page} to {end_page}), not any printed page numbers in the PDF.
+
+Important reminders:
+- Top-level headings may be unnumbered, Roman-numbered, Arabic-numbered, or mixed.
+- Page 1 may contain multiple top-level headings.
+- If a heading is visible at the bottom of a page, assign it to THAT page.
+- Do not stop after finding only one heading on a page.
+- Ignore title, authors, affiliations, emails, keywords, captions, and subsection headings.
+- Return only headings that visually look like MAIN section headings.
 """
 
 
@@ -106,7 +139,12 @@ not the next one.
 # Page rendering (PyMuPDF → PNG bytes)
 # ---------------------------------------------------------------------------
 
-def _render_page_as_png(doc, page_idx: int, dpi: int = IMAGE_DPI, page_label: Optional[int] = None) -> Optional[bytes]:
+def _render_page_as_png(
+    doc,
+    page_idx: int,
+    dpi: int = IMAGE_DPI,
+    page_label: Optional[int] = None,
+) -> Optional[bytes]:
     """Render a single PDF page to PNG bytes using PyMuPDF.
 
     If page_label is given, burns a visible "Page N" label into the top-left
@@ -116,39 +154,43 @@ def _render_page_as_png(doc, page_idx: int, dpi: int = IMAGE_DPI, page_label: Op
     """
     try:
         import fitz
+
         page = doc[page_idx]
         zoom = dpi / 72.0
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
 
         if page_label is not None:
-            # Draw a white rounded rectangle + bold black text label in top-left.
-            # We use PIL if available (better text rendering); fall back to fitz annot.
             try:
                 from PIL import Image, ImageDraw, ImageFont
                 import io as _io
+
                 img = Image.open(_io.BytesIO(pix.tobytes("png")))
                 draw = ImageDraw.Draw(img)
                 label = f" Page {page_label} "
-                # Try to get a reasonable font size (≈2.5% of image height)
                 font_size = max(14, int(img.height * 0.025))
                 try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+                    font = ImageFont.truetype(
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                        font_size,
+                    )
                 except Exception:
                     font = ImageFont.load_default()
-                # Measure text
+
                 bbox = draw.textbbox((0, 0), label, font=font)
                 tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
                 pad = 4
-                # White background rectangle
-                draw.rectangle([0, 0, tw + pad * 2, th + pad * 2], fill="white", outline="black")
+                draw.rectangle(
+                    [0, 0, tw + pad * 2, th + pad * 2],
+                    fill="white",
+                    outline="black",
+                )
                 draw.text((pad, pad), label, fill="black", font=font)
                 buf = _io.BytesIO()
                 img.save(buf, format="PNG")
                 return buf.getvalue()
             except ImportError:
-                # PIL not available — write label as a fitz annotation (best-effort)
-                pass  # fall through to plain PNG
+                pass
 
         return pix.tobytes("png")
     except Exception as e:
@@ -167,22 +209,25 @@ def _png_to_base64(png_bytes: bytes) -> str:
 def _call_vision_batch(
     llm_client,
     doc,
-    page_indices: List[int],   # 0-based indices into fitz doc
-    page_numbers: List[int],   # 1-based page numbers matching page_indices
+    page_indices: List[int],
+    page_numbers: List[int],
+    *,
+    dpi: int = IMAGE_DPI,
+    detail: str = IMAGE_DETAIL,
+    batch_tag: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Send a batch of PDF page images to GPT-4o Vision.
     Returns list of {"heading": str, "page": int} dicts.
-    page numbers in the returned dicts are 1-based and match page_numbers param.
     """
     if not page_indices:
         return []
 
     start_page = page_numbers[0]
-    end_page   = page_numbers[-1]
+    end_page = page_numbers[-1]
+    tag = batch_tag or f"{start_page}-{end_page}"
 
-    # Build message content: text prompt + one image per page
-    content: List[Dict] = [
+    content: List[Dict[str, Any]] = [
         {
             "type": "text",
             "text": _HEADING_EXTRACTION_USER.format(
@@ -194,25 +239,28 @@ def _call_vision_batch(
 
     pages_added = 0
     for idx, pnum in zip(page_indices, page_numbers):
-        png = _render_page_as_png(doc, idx, page_label=pnum)
+        png = _render_page_as_png(doc, idx, dpi=dpi, page_label=pnum)
         if png is None:
             continue
-        content.append({
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/png;base64,{_png_to_base64(png)}",
-                "detail": "low",   # "low" = cheaper + faster, sufficient for text layout
-            },
-        })
+
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{_png_to_base64(png)}",
+                    "detail": detail,
+                },
+            }
+        )
         pages_added += 1
 
     if pages_added == 0:
-        logger.warning("[VISION_HEADING] No pages rendered for batch %d-%d", start_page, end_page)
+        logger.warning("[VISION_HEADING] No pages rendered for batch %s", tag)
         return []
 
     messages = [
         {"role": "system", "content": _HEADING_EXTRACTION_SYSTEM},
-        {"role": "user",   "content": content},
+        {"role": "user", "content": content},
     ]
 
     try:
@@ -220,50 +268,53 @@ def _call_vision_batch(
         if not raw or not raw.strip():
             return []
 
-        # Strip markdown fences if GPT wraps in ```json ... ```
         cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
         cleaned = re.sub(r"\s*```$", "", cleaned.strip(), flags=re.MULTILINE)
         cleaned = cleaned.strip()
 
         parsed = json.loads(cleaned)
         if not isinstance(parsed, list):
-            logger.warning("[VISION_HEADING] Unexpected response type: %s", type(parsed))
+            logger.warning("[VISION_HEADING] Unexpected response type for batch %s: %s", tag, type(parsed))
             return []
 
-        results = []
+        results: List[Dict[str, Any]] = []
         for item in parsed:
             if not isinstance(item, dict):
                 continue
+
             heading = str(item.get("heading") or "").strip()
-            page    = item.get("page")
+            page = item.get("page")
             if not heading:
                 continue
+
             try:
                 page_int = int(page)
             except (TypeError, ValueError):
                 continue
-            # Validate page is within the batch range (GPT sometimes hallucinates)
+
             if start_page <= page_int <= end_page:
-                results.append({
-                    "heading": heading,
-                    "page":    page_int,
-                })
+                results.append({"heading": heading, "page": page_int})
 
         logger.info(
-            "[VISION_HEADING] Batch pages %d-%d → %d headings: %s",
-            start_page, end_page, len(results),
+            "[VISION_HEADING] Batch %s → %d headings (dpi=%d, detail=%s): %s",
+            tag,
+            len(results),
+            dpi,
+            detail,
             [(r["heading"], r["page"]) for r in results],
         )
         return results
 
     except json.JSONDecodeError as e:
         logger.warning(
-            "[VISION_HEADING] JSON parse error for batch %d-%d: %s | raw=%r",
-            start_page, end_page, e, raw[:200] if raw else "",
+            "[VISION_HEADING] JSON parse error for batch %s: %s | raw=%r",
+            tag,
+            e,
+            raw[:200] if raw else "",
         )
         return []
     except Exception as e:
-        logger.error("[VISION_HEADING] Batch %d-%d failed: %s", start_page, end_page, e)
+        logger.error("[VISION_HEADING] Batch %s failed: %s", tag, e)
         return []
 
 
@@ -285,25 +336,22 @@ def _merge_batch_results(
       {"heading": str, "page_start": int, "page_end": int}
     sorted by page_start ascending.
     """
-    # Collect all detections, normalise heading text for deduplication.
-    # Normalisation: lowercase + strip section numbering ("1.", "I.", "A." prefixes)
-    seen:      Dict[str, int] = {}  # normalised_key → lowest page_start seen
-    canonical: Dict[str, str] = {}  # normalised_key → original heading text
+    seen: Dict[str, int] = {}
+    canonical: Dict[str, str] = {}
 
     for batch in all_results:
         for item in batch:
             heading = item["heading"].strip()
-            page    = item["page"]
+            page = item["page"]
             key = re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", heading.lower()).strip()
             key = re.sub(r"\s+", " ", key)
             if key not in seen or page < seen[key]:
-                seen[key]      = page
-                canonical[key] = heading   # prefer text from earliest occurrence
+                seen[key] = page
+                canonical[key] = heading
 
     if not seen:
         return []
 
-    # Build sorted list
     merged = [
         {"heading": canonical[k], "page_start": seen[k]}
         for k in seen
@@ -311,13 +359,6 @@ def _merge_batch_results(
     ]
     merged.sort(key=lambda x: x["page_start"])
 
-    # Infer page_end for each section.
-    # When a heading starts on page N, the previous section's page_end = N.
-    # Both sections share that page — the previous section gets it because its
-    # content may run to the middle of that page, and the next section gets it
-    # because its heading starts there. This is intentional duplication: no
-    # content is lost, both sections are fully represented.
-    # e.g. Abstract pages 1→1, Introduction pages 1→3, Background pages 3→6
     for i, section in enumerate(merged):
         if i + 1 < len(merged):
             section["page_end"] = merged[i + 1]["page_start"]
@@ -339,50 +380,6 @@ def _anchor_headings_with_pymupdf(
 ) -> List[Dict[str, Any]]:
     """
     Use PyMuPDF font-aware span search to pin each heading to the correct page.
-
-    WHY NAIVE TEXT SEARCH FAILS
-    ----------------------------
-    page.search_for("Introduction") matches every occurrence of the word — section
-    headings AND inline mentions ("as described in the Introduction..."). To find
-    only the real heading we use four layered signals:
-
-      1. SEARCH WINDOW (primary guard against cross-section contamination)
-         Each heading is only searched in [vision_page - search_window, vision_page + 1].
-         Because vision's estimate is already in the right neighbourhood (±1-2 pages),
-         a heading on page 33 will never accidentally match a mention of "Methodology"
-         in the Introduction on page 3 — those pages are outside the window entirely.
-
-      2. SECTION-NUMBER PREFIX (most discriminative signal)
-         If the heading carries a Roman/Arabic prefix ("XI. Conclusion", "3. Methodology"),
-         we search for the FULL prefixed string first. Prefixes virtually never appear
-         in body-text mentions, so a match is definitively the real heading.
-         Only when the prefix search fails do we fall through to font-size heuristics.
-
-      3. FONT SIZE >= BODY BASELINE (rejects body-text mentions in same window)
-         We compute the modal (most-frequent) font size on the page as the body-text
-         baseline. A span must be >= 95% of that size to qualify. Inline mentions of
-         heading words share the body font; real headings are the same size or larger.
-
-      4. RUNNING-HEADER / FOOTER EXCLUSION (rejects page-header repetitions)
-         Running headers that repeat the section name sit at the very top or bottom
-         of the page (y-position < 8% or > 92% of page height). We skip those zones
-         so "Introduction" printed as a chapter header on pages 2-5 does not steal
-         page 1's heading assignment.
-
-      5. STANDALONE LINE (rejects mid-sentence occurrences)
-         A real heading occupies its own line. We require the total text in the matched
-         line to be no more than 20 characters longer than the heading itself, which
-         rejects spans that appear in the middle of a long sentence.
-
-    Algorithm
-    ---------
-    For each section heading (in document order):
-      1. Narrow the search to [vision_page - search_window, vision_page + 1].
-      2. On each page in that window call _find_heading_span() which applies signals
-         2-5 in order, returning True on the first qualifying match.
-      3. The first page in the window with a qualifying match becomes page_start.
-      4. No match → keep vision's page_start (safe fallback, never makes things worse).
-    After all corrections: re-sort and rebuild page_end values.
     """
     from collections import Counter
 
@@ -397,7 +394,6 @@ def _anchor_headings_with_pymupdf(
         return bool(re.match(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", h.strip()))
 
     def _modal_font_size(page_dict: dict) -> float:
-        """Modal font size = body-text baseline for this page."""
         sizes: List[float] = []
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -411,41 +407,29 @@ def _anchor_headings_with_pymupdf(
         return Counter(sizes).most_common(1)[0][0]
 
     def _in_header_footer_zone(line: dict, page_height: float) -> bool:
-        """True if line sits in the top-8% or bottom-8% margin (running header/footer)."""
-        bbox = line.get("bbox")  # (x0, y0, x1, y1)
+        bbox = line.get("bbox")
         if not bbox or page_height <= 0:
             return False
         y0, y1 = bbox[1], bbox[3]
         mid_y = (y0 + y1) / 2.0
         return mid_y < page_height * 0.08 or mid_y > page_height * 0.92
 
-    def _find_heading_span(
-        page,
-        page_dict: dict,
-        heading_text: str,
-        body_size: float,
-    ) -> bool:
-        """
-        Return True if this page has a heading-quality occurrence of heading_text.
-
-        Signal 2 — prefixed full string (skip body-text mentions entirely).
-        Signal 3 + 4 + 5 — font size, header/footer exclusion, standalone line.
-        """
+    def _find_heading_span(page, page_dict: dict, heading_text: str, body_size: float) -> bool:
         ht_full = heading_text.strip()
         ht_stripped = _strip_prefix(ht_full)
         has_pfx = _has_prefix(ht_full)
         page_height = page.rect.height
 
-        # Signal 2: search for full prefixed string — match = definitely the heading
         if has_pfx:
             for candidate in [
-                ht_full, _expand_ligatures(ht_full),
-                ht_full.lower(), _expand_ligatures(ht_full).lower(),
+                ht_full,
+                _expand_ligatures(ht_full),
+                ht_full.lower(),
+                _expand_ligatures(ht_full).lower(),
             ]:
                 if page.search_for(candidate, quads=False):
                     return True
 
-        # Signals 3+4+5: walk spans for the stripped heading name
         target_norm = _norm(ht_stripped)
         if not target_norm:
             return False
@@ -454,7 +438,6 @@ def _anchor_headings_with_pymupdf(
             if block.get("type") != 0:
                 continue
             for line in block.get("lines", []):
-                # Signal 4: skip running headers / footers
                 if _in_header_footer_zone(line, page_height):
                     continue
 
@@ -469,11 +452,9 @@ def _anchor_headings_with_pymupdf(
                     if target_norm not in span_norm and span_norm not in target_norm:
                         continue
 
-                    # Signal 3: font size >= 95% of body baseline
                     if span.get("size", 0) < body_size * 0.95:
                         continue
 
-                    # Signal 5: heading should dominate its line (<=20 extra chars)
                     if len(line_norm) - len(target_norm) > 20:
                         continue
 
@@ -481,7 +462,6 @@ def _anchor_headings_with_pymupdf(
 
         return False
 
-    # ── Main anchoring loop ───────────────────────────────────────────────────
     corrected = 0
     for sec in merged:
         vision_page = sec["page_start"]
@@ -503,7 +483,9 @@ def _anchor_headings_with_pymupdf(
         if best_page is not None and best_page != vision_page:
             logger.info(
                 "[VISION_HEADING] Anchor corrected '%s': page %d -> %d",
-                sec["heading"], vision_page, best_page,
+                sec["heading"],
+                vision_page,
+                best_page,
             )
             sec["page_start"] = best_page
             corrected += 1
@@ -511,7 +493,8 @@ def _anchor_headings_with_pymupdf(
     if corrected:
         logger.info(
             "[VISION_HEADING] PyMuPDF anchoring corrected %d/%d heading(s)",
-            corrected, len(merged),
+            corrected,
+            len(merged),
         )
         merged.sort(key=lambda x: x["page_start"])
         for i, section in enumerate(merged):
@@ -522,38 +505,539 @@ def _anchor_headings_with_pymupdf(
 
     return merged
 
+# ---------------------------------------------------------------------------
+# Heading confidence scoring
+# ---------------------------------------------------------------------------
+
+def _score_headings(
+    merged: List[Dict[str, Any]],
+    doc,
+    total_pages: int,
+    threshold: float = 0.55,
+) -> List[Dict[str, Any]]:
+    """
+    Compute confidence score for each detected heading and
+    remove low-confidence headings.
+
+    IMPORTANT:
+    After filtering, page ranges are recomputed so section boundaries stay valid.
+    """
+    from collections import Counter
+
+    def _norm(s: str) -> str:
+        s = _expand_ligatures(s.lower())
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _strip_prefix(h: str) -> str:
+        return re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", h.strip()).strip()
+
+    def _modal_font_size(page_dict: dict) -> float:
+        sizes = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("text", "").strip():
+                        sizes.append(round(span.get("size", 0), 1))
+        if not sizes:
+            return 10.0
+        return Counter(sizes).most_common(1)[0][0]
+
+    def _in_header_footer_zone(line: dict, page_height: float) -> bool:
+        bbox = line.get("bbox")
+        if not bbox or page_height <= 0:
+            return False
+        mid_y = (bbox[1] + bbox[3]) / 2.0
+        return mid_y < page_height * 0.08 or mid_y > page_height * 0.92
+
+    filtered: List[Dict[str, Any]] = []
+
+    for sec in merged:
+        heading = sec["heading"]
+        page = sec["page_start"]
+
+        try:
+            page_obj = doc[page - 1]
+            page_dict = page_obj.get_text("dict", flags=0)
+            page_height = page_obj.rect.height
+        except Exception:
+            # If scoring cannot run, keep the heading rather than losing it
+            filtered.append(sec)
+            continue
+
+        body_size = _modal_font_size(page_dict)
+
+        # Current implementation has no true GPT probability,
+        # so this is treated as a fixed prior.
+        gpt_score = 1.0
+        text_match = 0.0
+        typo_score = 0.0
+
+        target = _norm(_strip_prefix(heading))
+        found = False
+
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            for line in block.get("lines", []):
+                if _in_header_footer_zone(line, page_height):
+                    continue
+
+                spans = line.get("spans", [])
+                line_text = "".join(s.get("text", "") for s in spans).strip()
+                if not line_text:
+                    continue
+
+                line_norm = _norm(line_text)
+
+                if target in line_norm:
+                    text_match = 1.0
+
+                    max_size = max(
+                        (s.get("size", 0) for s in spans if s.get("text", "").strip()),
+                        default=0,
+                    )
+
+                    if max_size >= body_size * 1.10:
+                        typo_score = 1.0
+                    elif max_size >= body_size * 0.95:
+                        typo_score = 0.6
+                    else:
+                        typo_score = 0.2
+
+                    found = True
+                    break
+
+            if found:
+                break
+
+        confidence = (0.5 * gpt_score) + (0.3 * text_match) + (0.2 * typo_score)
+
+        logger.info(
+            "[VISION_HEADING] Confidence '%s' page %d → %.2f",
+            heading,
+            page,
+            confidence,
+        )
+
+        if confidence >= threshold:
+            filtered.append(sec)
+        else:
+            logger.warning(
+                "[VISION_HEADING] Dropped low-confidence heading '%s' (%.2f)",
+                heading,
+                confidence,
+            )
+
+    # IMPORTANT: recompute page ranges after filtering
+    if not filtered:
+        return []
+
+    filtered.sort(key=lambda x: x["page_start"])
+
+    for i, section in enumerate(filtered):
+        if i + 1 < len(filtered):
+            section["page_end"] = filtered[i + 1]["page_start"]
+        else:
+            section["page_end"] = total_pages
+
+    return filtered
 
 # ---------------------------------------------------------------------------
-# Shared-page text splitter
+# Infer missing numbered sections (gap detection)
 # ---------------------------------------------------------------------------
+
+_ROMAN_TO_INT: Dict[str, int] = {
+    "I": 1, "II": 2, "III": 3, "IV": 4, "V": 5,
+    "VI": 6, "VII": 7, "VIII": 8, "IX": 9, "X": 10,
+    "XI": 11, "XII": 12, "XIII": 13, "XIV": 14, "XV": 15,
+    "XVI": 16, "XVII": 17, "XVIII": 18, "XIX": 19, "XX": 20,
+}
+_INT_TO_ROMAN: Dict[int, str] = {v: k for k, v in _ROMAN_TO_INT.items()}
+
+_ARABIC_PREFIX_RE = re.compile(r"^(\d+)[.)]\s+")
+_ROMAN_PREFIX_RE = re.compile(r"^([IVXivx]+)[.)]\s+", re.IGNORECASE)
+
+
+def _infer_missing_numbered_sections(
+    merged: List[Dict[str, Any]],
+    doc,
+    total_pages: int,
+) -> List[Dict[str, Any]]:
+    """
+    Detect gaps in Roman / Arabic heading sequence and recover them generically.
+
+    Recovery order:
+    1. Try exact prefix-based recovery (e.g. "I.", "3.")
+    2. If that fails, try generic heading-like line recovery in the plausible page window
+       and synthesize the expected prefix onto the recovered heading text.
+
+    This keeps recovery generic and avoids hardcoding "Introduction".
+    """
+    from collections import Counter
+
+    def _norm(s: str) -> str:
+        s = _expand_ligatures(s.lower())
+        return re.sub(r"\s+", " ", s).strip()
+
+    def _strip_prefix(h: str) -> str:
+        return re.sub(r"^[\d]+[.)]\s*|^[IVXivx]+[.)]\s*", "", h.strip()).strip()
+
+    def _modal_font_size(page_dict: dict) -> float:
+        sizes: List[float] = []
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("text", "").strip():
+                        sizes.append(round(span.get("size", 0), 1))
+        if not sizes:
+            return 10.0
+        return Counter(sizes).most_common(1)[0][0]
+
+    def _in_header_footer_zone(line: dict, page_height: float) -> bool:
+        bbox = line.get("bbox")
+        if not bbox or page_height <= 0:
+            return False
+        mid_y = (bbox[1] + bbox[3]) / 2.0
+        return mid_y < page_height * 0.08 or mid_y > page_height * 0.92
+
+    def _line_looks_like_top_heading(
+        line_text: str,
+        spans: List[dict],
+        body_size: float,
+    ) -> bool:
+        txt = line_text.strip()
+        if not txt:
+            return False
+
+        txt_norm = _norm(txt)
+        words = txt_norm.split()
+        if not words:
+            return False
+
+        if len(txt_norm) > 120:
+            return False
+
+        if len(words) > 18:
+            return False
+
+        if txt.endswith("."):
+            return False
+
+        if re.match(r"^(figure|fig\.|table)\s+\d+", txt_norm):
+            return False
+
+        if re.match(r"^[A-Z]\.\s*$", txt.strip()):
+            return False
+
+        if re.match(r"^\d+\.\d+", txt.strip()):
+            return False
+
+        if re.match(r"^[A-Z]\.", txt.strip()) and len(words) <= 3:
+            return False
+
+        max_span_size = max(
+            (s.get("size", 0) for s in spans if s.get("text", "").strip()),
+            default=0,
+        )
+        if max_span_size < body_size * 0.98:
+            return False
+
+        return True
+
+    def _search_pages_for_prefix(
+        prefix_str: str,
+        page_lo: int,
+        page_hi: int,
+    ) -> Optional[Tuple[int, str]]:
+        prefix_norm = _norm(prefix_str)
+
+        for pnum in range(page_lo, page_hi + 1):
+            try:
+                page = doc[pnum - 1]
+                page_dict = page.get_text("dict", flags=0)
+                body_size = _modal_font_size(page_dict)
+                page_height = page.rect.height
+
+                for block in page_dict.get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
+
+                    for line in block.get("lines", []):
+                        if _in_header_footer_zone(line, page_height):
+                            continue
+
+                        spans = line.get("spans", [])
+                        line_text = "".join(s.get("text", "") for s in spans).strip()
+                        line_norm = _norm(line_text)
+
+                        if not line_norm.startswith(prefix_norm):
+                            continue
+
+                        if not _line_looks_like_top_heading(line_text, spans, body_size):
+                            continue
+
+                        logger.info(
+                            "[VISION_HEADING] Gap-recovery prefix-match: found '%s' on page %d",
+                            line_text,
+                            pnum,
+                        )
+                        return pnum, line_text
+
+            except Exception as exc:
+                logger.debug("[VISION_HEADING] Gap-recovery prefix search error page %d: %s", pnum, exc)
+
+        return None
+
+    def _search_pages_for_generic_heading_candidate(
+        expected_prefix: str,
+        page_lo: int,
+        page_hi: int,
+    ) -> Optional[Tuple[int, str]]:
+        """
+        Generic fallback:
+        find a heading-like standalone line in the plausible page window,
+        excluding lines that already belong to numbered headings we already know.
+        """
+        known_heading_norms = {
+            _norm(_strip_prefix(sec["heading"])) for sec in merged
+        }
+
+        candidate_hits: List[Tuple[int, str, float]] = []
+
+        for pnum in range(page_lo, page_hi + 1):
+            try:
+                page = doc[pnum - 1]
+                page_dict = page.get_text("dict", flags=0)
+                body_size = _modal_font_size(page_dict)
+                page_height = page.rect.height
+
+                for block in page_dict.get("blocks", []):
+                    if block.get("type") != 0:
+                        continue
+
+                    for line in block.get("lines", []):
+                        if _in_header_footer_zone(line, page_height):
+                            continue
+
+                        spans = line.get("spans", [])
+                        line_text = "".join(s.get("text", "") for s in spans).strip()
+                        if not line_text:
+                            continue
+
+                        line_norm = _norm(line_text)
+                        stripped_norm = _norm(_strip_prefix(line_text))
+
+                        if not _line_looks_like_top_heading(line_text, spans, body_size):
+                            continue
+
+                        if stripped_norm in known_heading_norms:
+                            continue
+
+                        if re.match(r"^[IVXivx]+[.)]\s+", line_text) or re.match(r"^\d+[.)]\s+", line_text):
+                            continue
+
+                        words = stripped_norm.split()
+                        if len(words) < 1 or len(words) > 12:
+                            continue
+
+                        max_span_size = max(
+                            (s.get("size", 0) for s in spans if s.get("text", "").strip()),
+                            default=0,
+                        )
+                        score = float(max_span_size) - (0.01 * len(stripped_norm))
+                        candidate_hits.append((pnum, line_text, score))
+
+            except Exception as exc:
+                logger.debug("[VISION_HEADING] Gap-recovery generic search error page %d: %s", pnum, exc)
+
+        if not candidate_hits:
+            return None
+
+        candidate_hits.sort(key=lambda x: (x[0], -x[2]))
+        best_page, best_text, _ = candidate_hits[0]
+        synthesized = f"{expected_prefix} {best_text}".strip()
+
+        logger.info(
+            "[VISION_HEADING] Gap-recovery generic-match: synthesized '%s' on page %d from line '%s'",
+            synthesized,
+            best_page,
+            best_text,
+        )
+        return best_page, synthesized
+
+    numbered: List[Tuple[int, str, int]] = []
+    for i, sec in enumerate(merged):
+        h = sec["heading"].strip()
+        m_r = _ROMAN_PREFIX_RE.match(h)
+        m_a = _ARABIC_PREFIX_RE.match(h)
+        if m_r:
+            roman_str = m_r.group(1).upper()
+            val = _ROMAN_TO_INT.get(roman_str)
+            if val is not None:
+                numbered.append((i, "roman", val))
+        elif m_a:
+            numbered.append((i, "arabic", int(m_a.group(1))))
+
+    if not numbered:
+        return merged
+
+    kind_counts = Counter(k for _, k, _ in numbered)
+    dominant_kind = kind_counts.most_common(1)[0][0]
+    numbered = [(i, k, n) for i, k, n in numbered if k == dominant_kind]
+    if not numbered:
+        return merged
+
+    detected_nums = {n for _, _, n in numbered}
+    last_num = max(detected_nums)
+    all_expected = set(range(1, last_num + 1))
+    missing_nums = sorted(all_expected - detected_nums)
+
+    if not missing_nums:
+        return merged
+
+    logger.info(
+        "[VISION_HEADING] Gap detection: detected=%s  missing=%s  kind=%s",
+        sorted(detected_nums),
+        missing_nums,
+        dominant_kind,
+    )
+
+    num_to_page: Dict[int, int] = {}
+    for i, _, n in numbered:
+        num_to_page[n] = merged[i]["page_start"]
+
+    all_heading_pages = sorted(sec["page_start"] for sec in merged)
+
+    new_sections: List[Dict[str, Any]] = []
+
+    for miss in missing_nums:
+        next_page = num_to_page.get(miss + 1, total_pages)
+
+        prev_numbered_page = num_to_page.get(miss - 1)
+        if prev_numbered_page is not None:
+            search_lo = max(1, prev_numbered_page)
+        else:
+            preceding = [p for p in all_heading_pages if p < next_page]
+            search_lo = max(preceding) if preceding else 1
+
+        search_hi = min(total_pages, next_page)
+
+        if dominant_kind == "roman":
+            roman_str = _INT_TO_ROMAN.get(miss)
+            if roman_str is None:
+                continue
+            prefix_str = roman_str + "."
+        else:
+            prefix_str = str(miss) + "."
+
+        result = _search_pages_for_prefix(prefix_str, search_lo, search_hi)
+
+        if result is None:
+            result = _search_pages_for_generic_heading_candidate(
+                expected_prefix=prefix_str,
+                page_lo=search_lo,
+                page_hi=search_hi,
+            )
+
+        if result is None:
+            logger.info(
+                "[VISION_HEADING] Gap-recovery: '%s' not recovered in pages %d-%d — skipping",
+                prefix_str,
+                search_lo,
+                search_hi,
+            )
+            continue
+
+        found_page, found_text = result
+        new_sections.append(
+            {
+                "heading": found_text,
+                "page_start": found_page,
+                "page_end": -1,
+                "_recovered": True,
+            }
+        )
+
+    MANDATORY_UNNUMBERED = ["abstract", "acknowledgements", "acknowledgments"]
+
+    detected_normalised = {
+        re.sub(r"^[IVXivx]+[.)]\s*|^\d+[.)]\s*", "", sec["heading"].lower()).strip()
+        for sec in merged
+    }
+
+    for label in MANDATORY_UNNUMBERED:
+        if label in detected_normalised:
+            continue
+
+        if label == "abstract":
+            search_lo, search_hi = 1, min(5, total_pages)
+        else:
+            search_lo, search_hi = max(1, total_pages - 10), total_pages
+
+        result = _search_pages_for_prefix(label, search_lo, search_hi)
+        if result is not None:
+            found_page, found_text = result
+            new_sections.append(
+                {
+                    "heading": found_text,
+                    "page_start": found_page,
+                    "page_end": -1,
+                    "_recovered": True,
+                }
+            )
+            logger.info(
+                "[VISION_HEADING] Mandatory-heading recovery: inserted '%s' on page %d",
+                found_text,
+                found_page,
+            )
+
+    if not new_sections:
+        return merged
+
+    combined = merged + new_sections
+    combined.sort(key=lambda x: x["page_start"])
+
+    for i, sec in enumerate(combined):
+        if i + 1 < len(combined):
+            sec["page_end"] = combined[i + 1]["page_start"]
+        else:
+            sec["page_end"] = total_pages
+        sec.pop("_recovered", None)
+
+    logger.info(
+        "[VISION_HEADING] Gap-recovery inserted %d missing section(s): %s",
+        len(new_sections),
+        [(s["heading"], s["page_start"]) for s in new_sections],
+    )
+
+    return combined
 
 
 # ---------------------------------------------------------------------------
 # Ligature normalisation table
 # ---------------------------------------------------------------------------
-# LaTeX PDFs store ligatures as single Unicode codepoints (e.g. ﬁ = fi).
-# PyMuPDF returns them as-is; GPT-4o Vision reads the rendered image and
-# returns normal ASCII letters. This table maps ligature → ASCII expansion
-# so both strings can be compared after normalisation.
 _LIGATURES: Dict[str, str] = {
-    "\ufb00": "ff",   # ﬀ
-    "\ufb01": "fi",   # ﬁ
-    "\ufb02": "fl",   # ﬂ
-    "\ufb03": "ffi",  # ﬃ
-    "\ufb04": "ffl",  # ﬄ
-    "\ufb05": "st",   # ﬅ
-    "\ufb06": "st",   # ﬆ
-    "\u0133": "ij",   # ĳ
-    "\u0132": "IJ",   # Ĳ
+    "\ufb00": "ff",
+    "\ufb01": "fi",
+    "\ufb02": "fl",
+    "\ufb03": "ffi",
+    "\ufb04": "ffl",
+    "\ufb05": "st",
+    "\ufb06": "st",
+    "\u0133": "ij",
+    "\u0132": "IJ",
 }
 
+
 def _expand_ligatures(s: str) -> str:
-    """Replace Unicode ligature characters with their ASCII equivalents."""
     for lig, exp in _LIGATURES.items():
         s = s.replace(lig, exp)
     return s
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -562,38 +1046,20 @@ def _expand_ligatures(s: str) -> str:
 
 def _build_sections_from_headings(
     merged_headings: List[Dict[str, Any]],
-    page_texts: Dict[int, str],    # 1-based page_num → extracted text
+    page_texts: Dict[int, str],
     total_pages: int,
 ) -> Tuple["SectionAssembly", "HeadingTree"]:
-    """
-    Combine GPT-4o heading positions with PyMuPDF page text to produce
-    PaperSection objects and a HeadingTree.
-
-    Shared pages are given to BOTH neighbouring sections intentionally.
-    e.g. if Introduction starts mid-page-2:
-      Abstract    → pages 1–2  (includes tail of page 2)
-      Introduction → pages 2–4 (includes head of page 2)
-    No content is lost. The slight duplication at boundaries is acceptable
-    for RAG — both sections are fully represented.
-
-    A one-page backwards buffer (page_start - 1) is also applied so that
-    headings detected one page late (bottom-of-page misattribution) still
-    capture the correct content. The LLM ignores irrelevant overlap.
-    """
     from pdf_ingestion.app.section_assembler import SectionAssembly, PaperSection
     from pdf_ingestion.app.structural_extractor import HeadingTree, Heading
 
     sections: List[PaperSection] = []
-    headings: List[Heading]      = []
+    headings: List[Heading] = []
 
     for idx, sec in enumerate(merged_headings):
-        heading_text   = sec["heading"]
-        page_start     = sec["page_start"]
-        page_end       = sec["page_end"]
+        heading_text = sec["heading"]
+        page_start = sec["page_start"]
+        page_end = sec["page_end"]
 
-        # One-page backwards buffer: if the heading was detected one page late
-        # (bottom-of-page misattribution), this ensures the actual heading page
-        # is still included in the section's content. The LLM filters any noise.
         fetch_from = max(1, page_start - 1)
 
         text_parts: List[str] = []
@@ -604,24 +1070,27 @@ def _build_sections_from_headings(
 
         content_text = "\n\n".join(text_parts).strip()
 
-        sections.append(PaperSection(
-            section_index  = idx,
-            heading_level  = 1,
-            heading_text   = heading_text,
-            parent_heading = None,
-            page_start     = page_start,
-            page_end       = page_end,
-            content_text   = content_text,
-            content_length = len(content_text),
-        ))
+        sections.append(
+            PaperSection(
+                section_index=idx,
+                heading_level=1,
+                heading_text=heading_text,
+                parent_heading=None,
+                page_start=page_start,
+                page_end=page_end,
+                content_text=content_text,
+                content_length=len(content_text),
+            )
+        )
 
-        headings.append(Heading(
-            level = 1,
-            text  = heading_text,
-            page  = page_start,
-        ))
+        headings.append(
+            Heading(
+                level=1,
+                text=heading_text,
+                page=page_start,
+            )
+        )
 
-    # Filter out sections with no content and re-index
     sections = [s for s in sections if s.content_text.strip()]
     for i, s in enumerate(sections):
         s.section_index = i
@@ -641,16 +1110,6 @@ def extract_sections_via_vision_headings(
     """
     Extract paper sections using GPT-4o Vision for heading detection
     and PyMuPDF for text extraction.
-
-    Pipeline:
-      1. PyMuPDF: extract flat page text + render page images
-      2. GPT-4o Vision: detect top-level headings + start pages (parallel batches)
-      3. Merge + deduplicate heading detections across overlapping batches
-      4. Slice PyMuPDF page text by heading page ranges → PaperSection objects
-      5. Build HeadingTree for outline fast-path in qa_service
-
-    Returns (SectionAssembly, HeadingTree, total_pages).
-    On any failure returns (SectionAssembly(error=...), HeadingTree(error=...), 0).
     """
     from pdf_ingestion.app.section_assembler import SectionAssembly
     from pdf_ingestion.app.structural_extractor import HeadingTree
@@ -665,7 +1124,6 @@ def extract_sections_via_vision_headings(
     if llm_client is None or not llm_client.enabled():
         return _err("LLM client not available for Vision heading extraction.")
 
-    # ── 1. Open PDF with PyMuPDF ──────────────────────────────────────────────
     try:
         import fitz
     except ImportError:
@@ -681,32 +1139,7 @@ def extract_sections_via_vision_headings(
         doc.close()
         return _err("PDF has zero pages.")
 
-    # ── 2. Extract page text via PyMuPDF (fast, ~1-3 sec total) ──────────────
-    #
-    # Column-aware extraction strategy:
-    # ─────────────────────────────────
-    # PyMuPDF's default get_text("text") reads blocks in PDF-storage order, which
-    # for two-column papers (IEEE, ACM, medical journals) causes left/right column
-    # text to be interleaved — breaking chunking and RAG quality.
-    #
-    # Fix: use get_text("dict") to get bounding boxes, detect two-column layout
-    # via a gap-based heuristic, then sort blocks into correct reading order.
-    #
-    # Column detection (conservative — only fires when clearly two-column):
-    #   1. Exclude full-width blocks (spanning >80% of page) — these are titles.
-    #   2. Collect the unique x0 (left-edge) values of all remaining blocks.
-    #   3. Find the largest gap between consecutive x0 values.
-    #   4. Two-column if: gap > 20% of page width AND gap midpoint is in the
-    #      middle 25–75% of the page AND both sides have >= 2 blocks.
-    #
-    # Single-column papers (most arXiv ML/CS preprints): heuristic never fires.
-    # Falls back to get_text("text") if dict extraction errors on any page.
-
     def _detect_and_extract(page) -> Tuple[str, bool]:
-        """
-        Returns (text, is_two_column).
-        Extracts text with correct reading order for both 1- and 2-column layouts.
-        """
         try:
             raw = page.get_text("dict", flags=0)
         except Exception:
@@ -720,48 +1153,43 @@ def extract_sections_via_vision_headings(
         if not blocks:
             return "", False
 
-        # Full-width blocks span the entire page width (titles, abstract headers)
         full_blks = [b for b in blocks if (b["bbox"][2] - b["bbox"][0]) > pw * 0.80]
-        full_ids  = {id(b) for b in full_blks}
-        non_full  = [b for b in blocks if id(b) not in full_ids]
+        full_ids = {id(b) for b in full_blks}
+        non_full = [b for b in blocks if id(b) not in full_ids]
 
-        # ── Gap-based column detection ─────────────────────────────────────────
-        # Collect distinct x0 positions of non-full-width blocks.
-        # A large gap in x0 values with the gap midpoint in the page's middle zone
-        # is the signature of a two-column layout.
         is_two_col = False
-        divider    = pw / 2.0   # default fallback
+        divider = pw / 2.0
 
         if len(non_full) >= 4:
             x0s = sorted({round(b["bbox"][0]) for b in non_full})
             if len(x0s) >= 2:
-                # Find (gap_size, gap_midpoint) for each consecutive x0 pair
                 gap_pairs = [
                     (x0s[i + 1] - x0s[i], (x0s[i] + x0s[i + 1]) / 2.0)
                     for i in range(len(x0s) - 1)
                 ]
                 best_gap, best_mid = max(gap_pairs, key=lambda g: g[0])
 
-                # Fire only if: gap is large AND in the middle of the page
-                if (best_gap > pw * 0.20
-                        and pw * 0.25 <= best_mid <= pw * 0.75):
-                    left_blks  = [b for b in non_full if b["bbox"][0] < best_mid]
+                if best_gap > pw * 0.20 and pw * 0.25 <= best_mid <= pw * 0.75:
+                    left_blks = [b for b in non_full if b["bbox"][0] < best_mid]
                     right_blks = [b for b in non_full if b["bbox"][0] >= best_mid]
                     if len(left_blks) >= 2 and len(right_blks) >= 2:
                         is_two_col = True
-                        divider    = best_mid
+                        divider = best_mid
 
-        # ── Sort blocks into reading order ────────────────────────────────────
         if is_two_col:
-            col_left  = sorted([b for b in non_full if b["bbox"][0] <  divider], key=lambda b: b["bbox"][1])
-            col_right = sorted([b for b in non_full if b["bbox"][0] >= divider], key=lambda b: b["bbox"][1])
+            col_left = sorted(
+                [b for b in non_full if b["bbox"][0] < divider],
+                key=lambda b: b["bbox"][1],
+            )
+            col_right = sorted(
+                [b for b in non_full if b["bbox"][0] >= divider],
+                key=lambda b: b["bbox"][1],
+            )
             full_blks.sort(key=lambda b: b["bbox"][1])
-            # Reading order: full-width headers → left column top-to-bottom → right column top-to-bottom
             ordered = full_blks + col_left + col_right
         else:
             ordered = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
 
-        # ── Assemble text ──────────────────────────────────────────────────────
         lines: List[str] = []
         for blk in ordered:
             for line in blk.get("lines", []):
@@ -778,7 +1206,7 @@ def extract_sections_via_vision_headings(
             page = doc[page_idx]
             text, is_two_col = _detect_and_extract(page)
             if text:
-                page_texts[page_idx + 1] = text   # 1-based key
+                page_texts[page_idx + 1] = text
             if is_two_col:
                 two_col_pages += 1
         except Exception as e:
@@ -790,44 +1218,50 @@ def extract_sections_via_vision_headings(
 
     layout_guess = "two-column" if two_col_pages > total_pages * 0.3 else "single-column"
     logger.info(
-        "[VISION_HEADING] PyMuPDF extracted text from %d/%d pages "
-        "| layout=%s (%d/%d pages two-column)",
-        len(page_texts), total_pages, layout_guess, two_col_pages, total_pages,
+        "[VISION_HEADING] PyMuPDF extracted text from %d/%d pages | layout=%s (%d/%d pages two-column)",
+        len(page_texts),
+        total_pages,
+        layout_guess,
+        two_col_pages,
+        total_pages,
     )
 
-    # ── 3. Build overlapping batches ──────────────────────────────────────────
-    # pages are 1-based throughout
-    batches: List[List[int]] = []  # each element is a list of 1-based page numbers
+    batches: List[List[int]] = []
     start = 1
     while start <= total_pages:
         end = min(start + BATCH_SIZE - 1, total_pages)
         batches.append(list(range(start, end + 1)))
         if end == total_pages:
             break
-        # Next batch starts BATCH_OVERLAP pages before this batch ends
         start = end - BATCH_OVERLAP + 1
 
     logger.info(
         "[VISION_HEADING] Sending %d batches to GPT-4o Vision (batch_size=%d, overlap=%d)",
-        len(batches), BATCH_SIZE, BATCH_OVERLAP,
+        len(batches),
+        BATCH_SIZE,
+        BATCH_OVERLAP,
     )
 
-    # ── 4. Call GPT-4o Vision for each batch (run concurrently via threads) ───
-    # We use ThreadPoolExecutor because llm_client.chat() is synchronous.
-    # asyncio.get_running_loop().run_in_executor would require this function
-    # to be async; since it's called from an executor already (see ingest_pipeline),
-    # we just use concurrent.futures directly here.
     import concurrent.futures
 
     batch_results: List[List[Dict[str, Any]]] = [[] for _ in batches]
 
     def _run_batch(batch_idx: int, page_numbers: List[int]) -> List[Dict[str, Any]]:
-        page_indices = [p - 1 for p in page_numbers]  # convert to 0-based for fitz
+        page_indices = [p - 1 for p in page_numbers]
+
+        is_first_batch = 1 in page_numbers
+        dpi = FIRST_BATCH_IMAGE_DPI if is_first_batch else IMAGE_DPI
+        detail = FIRST_BATCH_IMAGE_DETAIL if is_first_batch else IMAGE_DETAIL
+        tag = f"{page_numbers[0]}-{page_numbers[-1]}"
+
         return _call_vision_batch(
-            llm_client  = llm_client,
-            doc         = doc,
-            page_indices= page_indices,
-            page_numbers= page_numbers,
+            llm_client=llm_client,
+            doc=doc,
+            page_indices=page_indices,
+            page_numbers=page_numbers,
+            dpi=dpi,
+            detail=detail,
+            batch_tag=tag,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(batches), 5)) as pool:
@@ -843,15 +1277,40 @@ def extract_sections_via_vision_headings(
                 logger.error("[VISION_HEADING] Batch %d raised exception: %s", i, e)
                 batch_results[i] = []
 
-    # ── 5. Merge + deduplicate headings across batches ────────────────────────
-    merged = _merge_batch_results(batch_results, total_pages)
+    # Extra focused early-pages pass for every PDF
+    early_pages_results: List[Dict[str, Any]] = []
+    early_pages = list(range(1, min(EARLY_PAGES_FOCUSED_COUNT, total_pages) + 1))
+    if early_pages:
+        logger.info(
+            "[VISION_HEADING] Running focused early-pages pass on pages %s (dpi=%d, detail=%s)",
+            early_pages,
+            EARLY_PAGES_IMAGE_DPI,
+            EARLY_PAGES_IMAGE_DETAIL,
+        )
+        early_pages_results = _call_vision_batch(
+            llm_client=llm_client,
+            doc=doc,
+            page_indices=[p - 1 for p in early_pages],
+            page_numbers=early_pages,
+            dpi=EARLY_PAGES_IMAGE_DPI,
+            detail=EARLY_PAGES_IMAGE_DETAIL,
+            batch_tag=f"focused-{early_pages[0]}-{early_pages[-1]}",
+        )
 
-    # ── 5b. PyMuPDF anchoring: correct off-by-one page errors from vision ─────
-    # The vision model sometimes assigns a heading to the page AFTER where the
-    # heading text physically appears (bottom-of-page effect). We use PyMuPDF's
-    # exact text search to pin each heading to its true page. doc is still open.
+    all_results = batch_results[:]
+    if early_pages_results:
+        all_results.append(early_pages_results)
+
+    merged = _merge_batch_results(all_results, total_pages)
+
     if merged:
         merged = _anchor_headings_with_pymupdf(merged, doc, total_pages)
+
+    if merged:
+        merged = _infer_missing_numbered_sections(merged, doc, total_pages)
+
+    if merged:
+         merged = _score_headings(merged, doc, total_pages)
 
     doc.close()
 
@@ -867,11 +1326,10 @@ def extract_sections_via_vision_headings(
         [(m["heading"], m["page_start"], m["page_end"]) for m in merged],
     )
 
-    # ── 6. Build SectionAssembly + HeadingTree ────────────────────────────────
     assembly, heading_tree = _build_sections_from_headings(
-        merged_headings = merged,
-        page_texts      = page_texts,
-        total_pages     = total_pages,
+        merged_headings=merged,
+        page_texts=page_texts,
+        total_pages=total_pages,
     )
 
     if assembly.is_empty():
@@ -879,7 +1337,8 @@ def extract_sections_via_vision_headings(
 
     logger.info(
         "[VISION_HEADING] Complete: %d sections, %d headings",
-        len(assembly.sections), len(heading_tree.headings),
+        len(assembly.sections),
+        len(heading_tree.headings),
     )
 
     return assembly, heading_tree, total_pages
