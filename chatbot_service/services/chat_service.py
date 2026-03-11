@@ -1184,10 +1184,10 @@ class ChatService:
         message = result.get("message", "")
 
         if status in ("ready", "already_ready"):
-            reply = f"Downloading......\n\n{message}\n\nSo what do you want to know about this paper?"
+            reply = f"Paper downloaded.\n\nSo what do you want to know about this paper?"
         else:
             # specific error from downloader/extractor/service — shown as-is
-            reply = f"Downloading......\n\n{message}"
+            reply = message
 
         return reply, [paper], self._meta(state)
 
